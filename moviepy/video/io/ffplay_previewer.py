@@ -5,6 +5,8 @@ out of VideoClips
 
 import subprocess as sp
 
+import numpy as np
+
 from moviepy.config import FFPLAY_BINARY
 from moviepy.tools import cross_platform_popen_params
 
@@ -56,7 +58,21 @@ class FFPLAY_VideoPreviewer:
     def show_frame(self, img_array):
         """Writes one frame in the file."""
         try:
-            self.proc.stdin.write(img_array.tobytes())
+            # Accept CuPy arrays (or other CUDA arrays) by downloading once here.
+            if hasattr(img_array, "__cuda_array_interface__"):
+                try:
+                    import cupy as cp
+
+                    img_array = cp.asnumpy(img_array)
+                except Exception:
+                    # Fall back to the old behavior which will raise a helpful error.
+                    pass
+
+            # ffplay expects C-contiguous raw bytes.
+            if isinstance(img_array, np.ndarray) and (not img_array.flags["C_CONTIGUOUS"]):
+                img_array = np.ascontiguousarray(img_array)
+
+            self.proc.stdin.write(memoryview(img_array))
         except IOError as err:
             _, ffplay_error = self.proc.communicate()
             if ffplay_error is not None:

@@ -181,6 +181,17 @@ class FFMPEG_VideoWriter:
     def write_frame(self, img_array):
         """Writes one frame in the file."""
         try:
+            # Accept CuPy arrays (or other CUDA arrays) by downloading once here.
+            if hasattr(img_array, "__cuda_array_interface__"):
+                try:
+                    import cupy as cp
+
+                    img_array = cp.asnumpy(img_array)
+                except Exception:
+                    # If conversion fails for any reason, fall back to the old
+                    # behavior which will raise a helpful error.
+                    pass
+
             # ffmpeg expects the data to be in C order, so we ensure that
             # the input array is contiguous in memory.
             if not img_array.flags["C_CONTIGUOUS"]:
@@ -288,6 +299,13 @@ def ffmpeg_write_video(
 
     has_mask = clip.mask is not None
 
+    # Experimental GPU render: keep compositing math on GPU (CuPy) and download
+    # once per output frame. Controlled via env vars in moviepy.video.tools.gpu_render.
+    try:
+        from moviepy.video.tools import gpu_render
+    except Exception:
+        gpu_render = None
+
     with FFMPEG_VideoWriter(
         filename,
         clip.size,
@@ -303,16 +321,26 @@ def ffmpeg_write_video(
         ffmpeg_params=ffmpeg_params,
         pixel_format=pixel_format,
     ) as writer:
-        for t, frame in clip.iter_frames(
-            logger=logger, with_times=True, fps=fps, dtype="uint8"
-        ):
-            if clip.mask is not None:
-                mask = 255 * clip.mask.get_frame(t)
-                if mask.dtype != "uint8":
-                    mask = mask.astype("uint8")
-                frame = np.dstack([frame, mask])
+        if (gpu_render is not None) and gpu_render.is_enabled() and gpu_render.is_available():
+            # Mirror Clip.iter_frames time arithmetic for compatibility.
+            n_frames = int(clip.duration * fps)
+            for frame_index in logger.iter_bar(frame_index=range(n_frames)):
+                t = np.float64(frame_index) / fps
+                # CuPy-native pipeline: keep frames on GPU and only download
+                # inside writer.write_frame.
+                frame = gpu_render.get_frame_for_export_uint8_gpu(clip, t)
+                writer.write_frame(frame)
+        else:
+            for t, frame in clip.iter_frames(
+                logger=logger, with_times=True, fps=fps, dtype=np.uint8
+            ):
+                if has_mask:
+                    mask = 255 * clip.mask.get_frame(t)
+                    if mask.dtype != np.uint8:
+                        mask = mask.astype(np.uint8)
+                    frame = np.dstack([frame, mask])
 
-            writer.write_frame(frame)
+                writer.write_frame(frame)
 
     if write_logfile:
         logfile.close()
@@ -340,8 +368,19 @@ def ffmpeg_write_image(filename, image, logfile=False, pixel_format=None):
         if the image data contains an alpha channel (``"rgba"``) or not
         (``"rgb24"``).
     """
+    if hasattr(image, "__cuda_array_interface__"):
+        try:
+            import cupy as cp
+
+            image = cp.asnumpy(image)
+        except Exception:
+            pass
+
     if image.dtype != "uint8":
         image = image.astype("uint8")
+
+    if not image.flags["C_CONTIGUOUS"]:
+        image = np.ascontiguousarray(image)
 
     if not pixel_format:
         pixel_format = "rgba" if (image.shape[2] == 4) else "rgb24"
@@ -370,7 +409,7 @@ def ffmpeg_write_image(filename, image, logfile=False, pixel_format=None):
     )
 
     proc = sp.Popen(cmd, **popen_params)
-    out, err = proc.communicate(image.tobytes())
+    out, err = proc.communicate(input=memoryview(image))
 
     if proc.returncode:
         error = (

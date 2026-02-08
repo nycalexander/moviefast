@@ -4,6 +4,7 @@ import numpy as np
 
 from moviepy.Clip import Clip
 from moviepy.Effect import Effect
+from moviepy.video.tools import scratch
 
 
 @dataclass
@@ -18,8 +19,12 @@ class MultiplyColor(Effect):
 
     def apply(self, clip: Clip) -> Clip:
         """Apply the effect to the clip."""
-        return clip.image_transform(
-            lambda frame: np.minimum(
-                255, np.multiply(frame, self.factor, dtype=np.float32)
-            ).astype("uint8")
-        )
+        factor = np.float32(self.factor)
+
+        def _mul(frame: np.ndarray) -> np.ndarray:
+            tmp = scratch.get_float32("multiplycolor_tmp", frame.shape)
+            np.multiply(frame, factor, out=tmp, casting="unsafe")
+            np.minimum(tmp, 255.0, out=tmp)
+            return tmp.astype("uint8")
+
+        return clip.image_transform(_mul)

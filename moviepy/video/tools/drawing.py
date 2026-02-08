@@ -138,8 +138,11 @@ def color_gradient(
         return arr * color_1 + (1 - arr) * color_2
 
     p1 = np.array(p1[::-1]).astype(float)
+    p1y, p1x = p1
 
-    M = np.dstack(np.meshgrid(range(w), range(h))[::-1]).astype(float)
+    # Coordinate grids (Y, X) with broadcasting, avoids building an HxWx2 array.
+    # Shapes: Y -> (h, 1), X -> (1, w)
+    Y, X = np.ogrid[:h, :w]
 
     if shape == "linear":
         if vector is None:
@@ -154,22 +157,25 @@ def color_gradient(
         n_vec = vector / norm**2  # norm 1/norm(vector)
 
         p1 = p1 + offset * vector
-        arr = (M - p1).dot(n_vec) / (1 - offset)
+        # (M - p1).dot(n_vec) computed without creating M.
+        arr = ((Y - p1y) * n_vec[0] + (X - p1x) * n_vec[1]) / (1 - offset)
         arr = np.minimum(1, np.maximum(0, arr))
         if color_1.size > 1:
-            arr = np.dstack(3 * [arr])
+            a = arr[..., None]
+            return a * color_1 + (1 - a) * color_2
         return arr * color_1 + (1 - arr) * color_2
 
     elif shape == "radial":
         if (radius or 0) == 0:
             arr = np.ones((h, w))
         else:
-            arr = (np.sqrt(((M - p1) ** 2).sum(axis=2))) - offset * radius
+            arr = np.sqrt((Y - p1y) ** 2 + (X - p1x) ** 2) - offset * radius
             arr = arr / ((1 - offset) * radius)
             arr = np.minimum(1.0, np.maximum(0, arr))
 
         if color_1.size > 1:
-            arr = np.dstack(3 * [arr])
+            a = arr[..., None]
+            return (1 - a) * color_1 + a * color_2
         return (1 - arr) * color_1 + arr * color_2
     raise ValueError("Invalid shape, should be either 'radial', 'linear' or 'bilinear'")
 

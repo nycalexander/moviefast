@@ -40,6 +40,17 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+accelerate = [
+    "numba>=0.59",
+]
+
+# GPU compositing is optional and best-effort.
+# We ship CuPy GPU kernels; OpenCV-CUDA support requires a custom OpenCV build
+# (PyPI wheels generally don't include CUDA). We still keep OpenCV as a base
+# dependency for CPU video decoding.
+gpu = [
+    "cupy-cuda13x>=13.0.0",
+]
 doc = [
     "numpydoc<2.0",
     "Sphinx==6.*",

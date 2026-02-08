@@ -1,8 +1,10 @@
 """Implements VideoFileClip, a class for video clips creation using video files."""
 
+import os
+
 from moviepy.audio.io.AudioFileClip import AudioFileClip
 from moviepy.decorators import convert_path_to_string
-from moviepy.video.io.ffmpeg_reader import FFMPEG_VideoReader
+from moviepy.video.io.ffmpeg_reader import FFMPEG_VideoReader, ffmpeg_parse_infos
 from moviepy.video.VideoClip import VideoClip
 
 
@@ -110,14 +112,77 @@ class VideoFileClip(VideoClip):
         if not pixel_format:
             pixel_format = "rgba" if has_mask else "rgb24"
 
-        self.reader = FFMPEG_VideoReader(
+        # Backend selection is internal-only and does not change the public API.
+        # When unset, default to 'auto': prefer OpenCV (with hwaccel attempt)
+        # then fall back to ffmpeg.
+        backend = (os.getenv("MOVIEPY_VIDEO_READER") or "auto").strip().lower()
+
+        infos = ffmpeg_parse_infos(
             filename,
-            decode_file=decode_file,
-            pixel_format=pixel_format,
-            target_resolution=target_resolution,
-            resize_algo=resize_algorithm,
+            check_duration=True,
             fps_source=fps_source,
+            decode_file=decode_file,
+            print_infos=False,
         )
+
+        def _make_ffmpeg_reader():
+            return FFMPEG_VideoReader(
+                filename,
+                decode_file=decode_file,
+                pixel_format=pixel_format,
+                target_resolution=target_resolution,
+                resize_algo=resize_algorithm,
+                fps_source=fps_source,
+                infos=infos,
+            )
+
+        def _try_make_opencv_reader():
+            from moviepy.video.io.opencv_reader import OpenCV_VideoReader
+
+            # First try with hwaccel hints, then without.
+            try:
+                return OpenCV_VideoReader(
+                    filename,
+                    decode_file=decode_file,
+                    pixel_format=pixel_format,
+                    target_resolution=target_resolution,
+                    resize_algo=resize_algorithm,
+                    fps_source=fps_source,
+                    infos=infos,
+                    prefer_hwaccel=True,
+                )
+            except Exception:
+                return OpenCV_VideoReader(
+                    filename,
+                    decode_file=decode_file,
+                    pixel_format=pixel_format,
+                    target_resolution=target_resolution,
+                    resize_algo=resize_algorithm,
+                    fps_source=fps_source,
+                    infos=infos,
+                    prefer_hwaccel=False,
+                )
+
+        force_ffmpeg = backend in {"ffmpeg", "pipe"}
+        force_opencv = backend in {"opencv", "cv2"}
+        is_auto = backend in {"", "auto"}
+
+        can_use_opencv = (
+            (not os.getenv("MOVIEPY_DISABLE_OPENCV"))
+            and (not pixel_format.lower().endswith("a"))
+            and (pixel_format.lower() == "rgb24")
+        )
+
+        if (force_opencv or is_auto) and can_use_opencv:
+            try:
+                self.reader = _try_make_opencv_reader()
+            except Exception:
+                self.reader = _make_ffmpeg_reader()
+        elif force_ffmpeg:
+            self.reader = _make_ffmpeg_reader()
+        else:
+            # Unknown backend value; be conservative.
+            self.reader = _make_ffmpeg_reader()
 
         # Make some of the reader's attributes accessible from the clip
         self.duration = self.reader.duration

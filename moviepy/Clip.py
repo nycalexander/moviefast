@@ -555,16 +555,24 @@ class Clip:
                   for frame in myclip.iter_frames()])
         """
         logger = proglog.default_bar_logger(logger)
-        for frame_index in logger.iter_bar(
-            frame_index=np.arange(0, int(self.duration * fps))
-        ):
-            # int is used to ensure that floating point errors are rounded
-            # down to the nearest integer
-            t = frame_index / fps
+
+        # Normalize dtype to a numpy dtype to support common inputs like "uint8".
+        # This also avoids triggering an unnecessary .astype() for every frame.
+        target_dtype = None if dtype is None else np.dtype(dtype)
+
+        # int() ensures floating point errors are rounded down.
+        n_frames = int(self.duration * fps)
+
+        for frame_index in logger.iter_bar(frame_index=range(n_frames)):
+            # Use numpy float arithmetic for t to preserve historical behavior.
+            # Some algorithms use exact float keys (e.g. in moviepy.video.tools.cuts),
+            # so we avoid small rounding differences from precomputed reciprocals.
+            t = np.float64(frame_index) / fps
 
             frame = self.get_frame(t)
-            if (dtype is not None) and (frame.dtype != dtype):
-                frame = frame.astype(dtype)
+            if (target_dtype is not None) and (frame.dtype != target_dtype):
+                frame = frame.astype(target_dtype)
+
             if with_times:
                 yield t, frame
             else:

@@ -54,14 +54,14 @@ class Margin(Effect):
             self.left = self.right = self.top = self.bottom = self.margin_size
 
         def make_bg(w, h):
-            new_w, new_h = w + self.left + self.right, h + self.top + self.bottom
-            if clip.is_mask:
-                shape = (new_h, new_w)
-                bg = np.tile(self.opacity, (new_h, new_w)).astype(float).reshape(shape)
-            else:
-                shape = (new_h, new_w, 3)
-                bg = np.tile(self.color, (new_h, new_w)).reshape(shape)
-            return bg
+          new_w, new_h = w + self.left + self.right, h + self.top + self.bottom
+          if clip.is_mask:
+            bg = np.empty((new_h, new_w), dtype=float)
+            bg.fill(float(self.opacity))
+          else:
+            bg = np.empty((new_h, new_w, 3), dtype=np.uint8)
+            bg[...] = self.color
+          return bg
 
         if isinstance(clip, ImageClip):
             im = make_bg(clip.w, clip.h)
