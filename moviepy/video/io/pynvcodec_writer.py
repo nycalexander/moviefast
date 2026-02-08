@@ -12,6 +12,7 @@ We still rely on FFmpeg for container muxing and (optionally) audio.
 from __future__ import annotations
 
 import os
+import subprocess as sp
 import tempfile
 from dataclasses import dataclass
 from typing import Optional
@@ -19,7 +20,7 @@ from typing import Optional
 import numpy as np
 
 from moviepy.config import FFMPEG_BINARY
-from moviepy.tools import ffmpeg_escape_filename, subprocess_call
+from moviepy.tools import cross_platform_popen_params, ffmpeg_escape_filename, subprocess_call
 
 
 def _env_flag(name: str, default: str = "0") -> bool:
@@ -204,6 +205,91 @@ def _ffmpeg_remux_h26x(
     subprocess_call(cmd, logger=logger)
 
 
+class _FFmpegH26xPipeMuxer:
+    """Mux an elementary H.264/HEVC stream from stdin into a container via FFmpeg."""
+
+    def __init__(
+        self,
+        *,
+        output_file: str,
+        fps: float,
+        is_hevc: bool,
+        audiofile: Optional[str],
+        audio_codec: Optional[str],
+        logger,
+    ):
+        stream_fmt = "hevc" if is_hevc else "h264"
+        cmd = [
+            FFMPEG_BINARY,
+            "-y",
+            "-loglevel",
+            "error",
+            "-r",
+            f"{fps:.02f}",
+            "-f",
+            stream_fmt,
+            "-i",
+            "pipe:0",
+        ]
+
+        if audiofile is not None:
+            cmd.extend(["-i", ffmpeg_escape_filename(audiofile)])
+            cmd.extend(["-map", "0:v:0", "-map", "1:a:0"])
+            cmd.extend(["-c:v", "copy"])
+            cmd.extend(["-c:a", audio_codec or "copy"])
+        else:
+            cmd.extend(["-map", "0:v:0", "-c:v", "copy", "-an"])
+
+        cmd.append(ffmpeg_escape_filename(output_file))
+
+        self._cmd = cmd
+        self._logger = logger
+        self._proc = None
+
+    def __enter__(self):
+        logger = self._logger
+        if logger is not None:
+            logger(message="MoviePy - Running:\n>>> " + " ".join(self._cmd))
+
+        popen_params = cross_platform_popen_params({"stdout": sp.DEVNULL, "stderr": sp.PIPE, "stdin": sp.PIPE})
+        self._proc = sp.Popen(self._cmd, **popen_params)
+        assert self._proc.stdin is not None
+        return self._proc.stdin
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        proc = self._proc
+        if proc is None:
+            return False
+
+        try:
+            if proc.stdin is not None:
+                try:
+                    proc.stdin.close()
+                except Exception:
+                    pass
+
+            if exc_type is not None:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+
+            _out, err = proc.communicate()
+            if proc.stderr is not None:
+                try:
+                    proc.stderr.close()
+                except Exception:
+                    pass
+
+            if exc_type is None and proc.returncode:
+                msg = (err or b"").decode("utf8", errors="replace")
+                raise IOError(msg)
+
+            return False
+        finally:
+            self._proc = None
+
+
 @dataclass
 class _EncodeContext:
     gpu_id: int
@@ -228,7 +314,8 @@ class _SurfaceConverterChain:
             out = cvt.Execute(out, self._cc)
             if out.Empty():
                 raise RuntimeError("GPU colorspace conversion failed")
-        return out.Clone(self._gpu_id)
+        # Returning the surface directly avoids an extra device copy.
+        return out
 
 
 class PyNvCodecNVENCWriter:
@@ -244,7 +331,7 @@ class PyNvCodecNVENCWriter:
         preset: str,
         bitrate: Optional[str],
         gpu_id: int,
-        out_stream_path: str,
+        out,
     ):
         import cupy as cp  # lazy
         nvc = _import_nvc()
@@ -260,9 +347,51 @@ class PyNvCodecNVENCWriter:
             preset=preset,
             bitrate=bitrate,
         )
-        self._out = open(out_stream_path, "wb")
-        self._out_stream_path = out_stream_path
+        self._out = out
         self._packet = np.ndarray(shape=(0,), dtype=np.uint8)
+
+        # Preallocate the input RGB_PLANAR surface once and write into it per-frame.
+        self._surface_rgb_planar = nvc.Surface.Make(nvc.PixelFormat.RGB_PLANAR, width, height, gpu_id)
+        self._surface_rgb_planar_pitch = int(self._surface_rgb_planar.Pitch())
+        # Create a CuPy view onto the surface's device memory to let kernels write into it.
+        dst_ptr = int(self._surface_rgb_planar.PlanePtr().GpuMem())
+        buf_bytes = self._surface_rgb_planar_pitch * (height * 3)
+        unowned = cp.cuda.UnownedMemory(dst_ptr, buf_bytes, self._surface_rgb_planar)
+        memptr = cp.cuda.MemoryPointer(unowned, 0)
+        self._surface_rgb_planar_view = cp.ndarray(
+            (height * 3, self._surface_rgb_planar_pitch),
+            dtype=cp.uint8,
+            memptr=memptr,
+            strides=(self._surface_rgb_planar_pitch, 1),
+        )
+
+        # Kernel: packed HWC RGB -> planar RGB in the VPF surface memory.
+        self._hwc_to_planar = cp.RawKernel(
+            r'''
+            extern "C" __global__ void hwc_to_planar_u8(
+                const unsigned char* __restrict__ src,
+                unsigned char* __restrict__ dst,
+                const int w,
+                const int h,
+                const int dst_pitch
+            ) {
+                int x = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+                int y = (int)(blockIdx.y * blockDim.y + threadIdx.y);
+                if (x >= w || y >= h) return;
+                int src_idx = (y * w + x) * 3;
+                unsigned char r = src[src_idx + 0];
+                unsigned char g = src[src_idx + 1];
+                unsigned char b = src[src_idx + 2];
+                int plane0 = y;
+                int plane1 = y + h;
+                int plane2 = y + 2 * h;
+                dst[plane0 * dst_pitch + x] = r;
+                dst[plane1 * dst_pitch + x] = g;
+                dst[plane2 * dst_pitch + x] = b;
+            }
+            ''',
+            "hwc_to_planar_u8",
+        )
 
         res = f"{width}x{height}"
         enc_params = {
@@ -307,38 +436,31 @@ class PyNvCodecNVENCWriter:
         except Exception:
             f = cp.ascontiguousarray(f)
 
-        # Packed HWC -> planar CHW, then a device-to-device copy into VPF surface.
-        chw = cp.transpose(f, (2, 0, 1))
-        chw = cp.ascontiguousarray(chw)
-
-        surface = nvc.Surface.Make(nvc.PixelFormat.RGB_PLANAR, self._ctx.width, self._ctx.height, self._ctx.gpu_id)
-        dst_ptr = surface.PlanePtr().GpuMem()
-        dst_pitch = surface.Pitch()
-        width_bytes = surface.Width()
-        height_rows = surface.Height() * 3
-        cp.cuda.runtime.memcpy2DAsync(
-            dst_ptr,
-            dst_pitch,
-            chw.data.ptr,
-            width_bytes,
-            width_bytes,
-            height_rows,
-            cp.cuda.runtime.memcpyDeviceToDevice,
-            0,
+        # Packed HWC -> planar surface, without allocating a CHW temporary.
+        threads = (16, 16)
+        grid = ((self._ctx.width + threads[0] - 1) // threads[0], (self._ctx.height + threads[1] - 1) // threads[1])
+        self._hwc_to_planar(
+            grid,
+            threads,
+            (f, self._surface_rgb_planar_view, int(self._ctx.width), int(self._ctx.height), int(self._surface_rgb_planar_pitch)),
         )
-        return surface
+        return self._surface_rgb_planar
+
+    def _write_packet(self):
+        if self._packet.size:
+            self._out.write(memoryview(self._packet))
 
     def write_frame(self, frame_rgb):
         surface_rgb = self._cupy_rgb_to_surface_rgb_planar(frame_rgb)
         surface_nv12 = self._to_nv12.run(surface_rgb)
         success = self._enc.EncodeSingleSurface(surface_nv12, self._packet)
         if success:
-            self._out.write(bytearray(self._packet))
+            self._write_packet()
 
     def close(self):
         if getattr(self, "_enc", None) is not None:
             while self._enc.FlushSinglePacket(self._packet):
-                self._out.write(bytearray(self._packet))
+                self._write_packet()
         if getattr(self, "_out", None) is not None:
             try:
                 self._out.close()
@@ -398,51 +520,38 @@ def try_write_video_pynvcodec(
     gpu_id = _parse_gpu_id()
     nvenc_preset = _map_nvenc_preset(preset)
 
-    # We encode to an elementary stream, then remux to the requested container.
-    suffix = ".hevc" if mapped == "hevc" else ".h264"
-    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
-    tmp_path = tmp.name
-    tmp.close()
-
     try:
         # These imports are intentionally inside the try so missing optional deps
         # just trigger a fallback.
         import cupy as _cp  # noqa: F401
         _import_nvc()
 
-        with PyNvCodecNVENCWriter(
-            width=clip.w,
-            height=clip.h,
-            fps=float(fps),
-            codec=mapped,
-            preset=nvenc_preset,
-            bitrate=bitrate,
-            gpu_id=gpu_id,
-            out_stream_path=tmp_path,
-        ) as writer:
-            n_frames = int(clip.duration * fps)
-            for frame_index in logger.iter_bar(frame_index=range(n_frames)):
-                t = np.float64(frame_index) / fps
-                frame = gpu_render.get_frame_for_export_uint8_gpu(clip, t)
-                writer.write_frame(frame)
-
-        _ffmpeg_remux_h26x(
-            input_stream=tmp_path,
+        with _FFmpegH26xPipeMuxer(
             output_file=filename,
             fps=float(fps),
             is_hevc=(mapped == "hevc"),
             audiofile=audiofile,
             audio_codec=audio_codec,
             logger=logger,
-        )
+        ) as mux_stdin:
+            with PyNvCodecNVENCWriter(
+                width=clip.w,
+                height=clip.h,
+                fps=float(fps),
+                codec=mapped,
+                preset=nvenc_preset,
+                bitrate=bitrate,
+                gpu_id=gpu_id,
+                out=mux_stdin,
+            ) as writer:
+                n_frames = int(clip.duration * fps)
+                for frame_index in logger.iter_bar(frame_index=range(n_frames)):
+                    t = np.float64(frame_index) / fps
+                    frame = gpu_render.get_frame_for_export_uint8_gpu(clip, t)
+                    writer.write_frame(frame)
+
         return True
     except Exception:
         if _strict() or backend in {"pynvcodec", "pynv", "nvenc"}:
             raise
         return False
-    finally:
-        try:
-            if os.path.exists(tmp_path):
-                os.remove(tmp_path)
-        except Exception:
-            pass
