@@ -32,6 +32,14 @@ _HWACCEL_PREFERENCE = (
 )
 
 
+def _env_flag(name: str, default: str = "0") -> bool:
+    val = os.environ.get(name, default)
+    if val is None:
+        return False
+    val = str(val).strip().lower()
+    return val not in {"", "0", "false", "off", "no", "none"}
+
+
 @lru_cache(maxsize=1)
 def _ffmpeg_hwaccels() -> set[str]:
     """Return the set of hwaccels supported by the configured ffmpeg binary."""
@@ -87,6 +95,54 @@ def _get_hwaccel_for_reader() -> str | None:
         return explicit
 
     return _default_hwaccel()
+
+
+def _hwaccel_output_format_for(hwaccel: str) -> str | None:
+    """Return the corresponding hwframes pixel format for a hwaccel.
+
+    This is used with ffmpeg's `-hwaccel_output_format` option.
+    """
+    # Values are pixel formats in ffmpeg.
+    mapping = {
+        "cuda": "cuda",
+        "qsv": "qsv",
+        "d3d11va": "d3d11",
+        "vaapi": "vaapi",
+        "videotoolbox": "videotoolbox",
+        "vdpau": "vdpau",
+    }
+    return mapping.get(hwaccel)
+
+
+def _get_hwaccel_output_format(hwaccel: str | None) -> str | None:
+    """Resolve whether to request ffmpeg hwframes output.
+
+    Precedence:
+    - MOVIEPY_FFMPEG_HWACCEL_OUTPUT_FORMAT sets an explicit value.
+      * "auto"/"1" enables a best-effort mapping.
+      * "none"/"0" disables.
+    - MOVIEPY_GPU_DECODE_E2E=1 enables best-effort mapping.
+
+    When enabled, ffmpeg will output frames in GPU memory (hwframes), and the
+    reader must insert `hwdownload` before piping rawvideo.
+    """
+    if not hwaccel:
+        return None
+
+    explicit = os.getenv("MOVIEPY_FFMPEG_HWACCEL_OUTPUT_FORMAT")
+    if explicit is not None:
+        explicit_s = explicit.strip().lower()
+        if not explicit_s or explicit_s in {"0", "false", "none", "off"}:
+            return None
+        if explicit_s in {"1", "true", "on", "auto"}:
+            return _hwaccel_output_format_for(hwaccel)
+        # User provided an explicit pixel format.
+        return explicit.strip()
+
+    if _env_flag("MOVIEPY_GPU_DECODE_E2E", "0"):
+        return _hwaccel_output_format_for(hwaccel)
+
+    return None
 
 
 class FFMPEG_VideoReader:
@@ -211,10 +267,24 @@ class FFMPEG_VideoReader:
         hwaccel = _get_hwaccel_for_reader()
         if (self.depth == 4) and (os.getenv("MOVIEPY_FFMPEG_HWACCEL") is None):
             hwaccel = None
+        hwaccel_output_format = _get_hwaccel_output_format(hwaccel)
+
+        hw_device = os.getenv("MOVIEPY_FFMPEG_HWACCEL_DEVICE")
+        i_arg_hw_basic = None
+        i_arg_hw_e2e = None
+
         if hwaccel:
-            i_arg_hw = ["-hwaccel", hwaccel] + i_arg
-        else:
-            i_arg_hw = None
+            i_arg_hw_basic = ["-hwaccel", hwaccel] + i_arg
+
+            if hwaccel_output_format:
+                i_arg_hw_e2e = ["-hwaccel", hwaccel]
+                if hw_device:
+                    i_arg_hw_e2e += ["-hwaccel_device", hw_device]
+                # Keep decoded frames on the accelerator until we explicitly download.
+                i_arg_hw_e2e += ["-hwaccel_output_format", hwaccel_output_format]
+                # A small pool helps avoid stalls on some drivers.
+                i_arg_hw_e2e += ["-extra_hw_frames", "64"]
+                i_arg_hw_e2e += i_arg
 
         # For webm video (vp8 and vp9) with transparent layer, force libvpx/libvpx-vp9
         # as ffmpeg native webm decoder dont decode alpha layer
@@ -228,7 +298,7 @@ class FFMPEG_VideoReader:
             elif codec_name == "vp8":
                 i_arg = ["-c:v", "libvpx"] + i_arg
 
-        def _build_cmd(i_arg_local):
+        def _build_cmd(i_arg_local, *, vf_override: str | None = None, sws_flags: str | None = None):
             cmd_local = [FFMPEG_BINARY] + i_arg_local
             cmd_local += [
                 "-loglevel",
@@ -237,7 +307,11 @@ class FFMPEG_VideoReader:
                 "image2pipe",
             ]
 
-            if self._needs_scaler:
+            if vf_override is not None:
+                cmd_local += ["-vf", vf_override]
+                if sws_flags:
+                    cmd_local += ["-sws_flags", sws_flags]
+            elif self._needs_scaler:
                 cmd_local += [
                     "-vf",
                     "scale=%d:%d" % tuple(self.size),
@@ -254,7 +328,38 @@ class FFMPEG_VideoReader:
             ]
             return cmd_local
 
-        cmd = _build_cmd(i_arg_hw or i_arg)
+        cmd_candidates = []
+
+        # Candidate 1: end-to-end hwaccel (hwframes) with explicit download.
+        if i_arg_hw_e2e is not None:
+            if hwaccel == "cuda" and self._needs_scaler and _env_flag("MOVIEPY_GPU_DECODE_SCALE", "1"):
+                # Scale on GPU when available, then download.
+                vf = "scale_cuda=%d:%d,hwdownload,format=%s" % (
+                    self.size[0],
+                    self.size[1],
+                    self.pixel_format,
+                )
+                cmd_candidates.append(_build_cmd(i_arg_hw_e2e, vf_override=vf))
+            else:
+                # Download then (optionally) scale on CPU and convert to output format.
+                vf_parts = ["hwdownload"]
+                if self._needs_scaler:
+                    vf_parts.append("scale=%d:%d" % tuple(self.size))
+                vf_parts.append("format=%s" % self.pixel_format)
+                cmd_candidates.append(
+                    _build_cmd(
+                        i_arg_hw_e2e,
+                        vf_override=",".join(vf_parts),
+                        sws_flags=self.resize_algo if self._needs_scaler else None,
+                    )
+                )
+
+        # Candidate 2: basic hwaccel (software filters/output), existing behavior.
+        if i_arg_hw_basic is not None:
+            cmd_candidates.append(_build_cmd(i_arg_hw_basic))
+
+        # Candidate 3: pure software decode.
+        cmd_candidates.append(_build_cmd(i_arg))
 
         popen_params = cross_platform_popen_params(
             {
@@ -268,19 +373,21 @@ class FFMPEG_VideoReader:
             self.proc = sp.Popen(cmd_to_run, **popen_params)
             self.last_read = self.read_frame()
 
-        try:
-            _spawn_and_preread(cmd)
-        except Exception:
-            # If hwaccel was attempted and failed, fall back to software decode.
-            if i_arg_hw is not None:
+        last_exc = None
+        for cmd_to_try in cmd_candidates:
+            try:
+                _spawn_and_preread(cmd_to_try)
+                last_exc = None
+                break
+            except Exception as exc:
+                last_exc = exc
                 try:
                     self.close(delete_lastread=False)
                 except Exception:
                     pass
-                cmd_sw = _build_cmd(i_arg)
-                _spawn_and_preread(cmd_sw)
-            else:
-                raise
+
+        if last_exc is not None:
+            raise last_exc
 
     def skip_frames(self, n=1):
         """Reads and throws away n frames"""

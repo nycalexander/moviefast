@@ -7,6 +7,7 @@ import numpy as np
 
 from moviepy.Clip import Clip
 from moviepy.Effect import Effect
+from moviepy.video.tools import cupy_utils
 
 
 @dataclass
@@ -180,6 +181,7 @@ class Rotate(Effect):
         def filter(get_frame, t):
             angle = get_angle(t)
             im = get_frame(t)
+            is_cuda = cupy_utils.is_cuda_array(im)
 
             if self.unit == "rad":
                 angle = math.degrees(angle)
@@ -189,15 +191,20 @@ class Rotate(Effect):
                 if (angle == 0) and self.expand:
                     return im
                 if (angle == 90) and self.expand:
-                    transpose = [1, 0] if len(im.shape) == 2 else [1, 0, 2]
-                    return np.transpose(im, axes=transpose)[::-1]
+                    transpose = (1, 0) if len(im.shape) == 2 else (1, 0, 2)
+                    return im.transpose(transpose)[::-1]
                 elif (angle == 270) and self.expand:
-                    transpose = [1, 0] if len(im.shape) == 2 else [1, 0, 2]
-                    return np.transpose(im, axes=transpose)[:, ::-1]
+                    transpose = (1, 0) if len(im.shape) == 2 else (1, 0, 2)
+                    return im.transpose(transpose)[:, ::-1]
                 elif (angle == 180) and self.expand:
                     return im[::-1, ::-1]
 
-            return self.rotate_frame(
+            cp = None
+            if is_cuda:
+                cp = cupy_utils.cupy()
+                im = cp.asnumpy(im)
+
+            rotated = self.rotate_frame(
                 im,
                 angle,
                 resample,
@@ -206,5 +213,9 @@ class Rotate(Effect):
                 self.translate,
                 self.bg_color,
             )
+
+            if cp is not None:
+                return cp.asarray(rotated)
+            return rotated
 
         return clip.transform(filter, apply_to=["mask"])

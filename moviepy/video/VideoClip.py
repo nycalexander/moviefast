@@ -45,6 +45,22 @@ from moviepy.video.tools import gpu_blend
 from moviepy.video.tools import scratch
 
 
+def _as_numpy_if_cuda_array(arr):
+    """Best-effort: convert CUDA arrays to NumPy for CPU code paths.
+
+    MoviePy's public API expects NumPy frames from `get_frame`, so any CUDA
+    arrays that reach CPU compositing/helpers must be downloaded.
+    """
+    if arr is None or not hasattr(arr, "__cuda_array_interface__"):
+        return arr
+    try:
+        import cupy as cp
+
+        return cp.asnumpy(arr)
+    except Exception:
+        return arr
+
+
 class VideoClip(Clip):
     """Base class for video clips.
 
@@ -195,10 +211,30 @@ class VideoClip(Clip):
           If is ``True`` the mask is saved in the alpha layer of the picture
           (only works with PNGs).
         """
-        im = self.get_frame(t)
+        # Best-effort GPU compositor (CuPy): keep compositing math on GPU and
+        # download only once at the imageio boundary.
+        im = None
+        try:
+            from moviepy.video.tools import gpu_render
+
+            if gpu_render.is_enabled() and gpu_render.is_available():
+                if with_mask and (self.mask is not None):
+                    im = gpu_render.get_frame_for_export_uint8_gpu(self, t)
+                else:
+                    im = gpu_render._composite_rgb_gpu(self, t)
+        except Exception:
+            im = None
+
+        if im is None:
+            im = self.get_frame(t)
+
+        im = _as_numpy_if_cuda_array(im)
         if with_mask and self.mask is not None:
-            mask = 255 * self.mask.get_frame(t)
-            im = np.dstack([im, mask]).astype("uint8")
+            # If GPU path already produced RGBA, keep it.
+            if not ((im.ndim == 3) and (im.shape[2] == 4)):
+                mask = _as_numpy_if_cuda_array(self.mask.get_frame(t))
+                mask = 255 * mask
+                im = np.dstack([im, mask]).astype("uint8")
         else:
             im = im.astype("uint8")
 
@@ -566,7 +602,19 @@ class VideoClip(Clip):
         #   from mpy.video.compositing.CompositeVideoClip import CompositeVideoClip
         #   clip = CompositeVideoClip([self.with_position((0, 0))])
 
-        frame = clip.get_frame(t)
+        frame = None
+        try:
+            from moviepy.video.tools import gpu_render
+
+            if gpu_render.is_enabled() and gpu_render.is_available():
+                frame = gpu_render._composite_rgb_gpu(clip, t)
+        except Exception:
+            frame = None
+
+        if frame is None:
+            frame = clip.get_frame(t)
+
+        frame = _as_numpy_if_cuda_array(frame)
         pil_img = Image.fromarray(frame.astype("uint8"))
 
         pil_img.show()
@@ -755,10 +803,14 @@ class VideoClip(Clip):
 
 
         """
+        background = _as_numpy_if_cuda_array(background)
+        if background_mask is not None:
+            background_mask = _as_numpy_if_cuda_array(background_mask)
+
         ct = t - self.start  # clip time
 
         # GET IMAGE AND MASK IF ANY
-        clip_frame = self.get_frame(ct)
+        clip_frame = _as_numpy_if_cuda_array(self.get_frame(ct))
         # Avoid an unconditional full-frame copy when the frame is already uint8.
         if clip_frame.dtype != np.uint8:
             clip_frame = clip_frame.astype("uint8")
@@ -768,7 +820,7 @@ class VideoClip(Clip):
 
         if self.mask is not None:
             # Clip mask normalize to 0 (fully transparent) to 1 (fully opaque)
-            clip_mask = self.mask.get_frame(ct)
+            clip_mask = _as_numpy_if_cuda_array(self.mask.get_frame(ct))
 
             # Resize clip_mask_img to match clip_img, always use top left corner
             if clip_frame.shape[:2] != clip_mask.shape[:2]:
@@ -831,9 +883,13 @@ class VideoClip(Clip):
         This is used by CompositeVideoClip to avoid allocating a new full-frame
         array for every layer.
         """
+        background = _as_numpy_if_cuda_array(background)
+        if background_mask is not None:
+            background_mask = _as_numpy_if_cuda_array(background_mask)
+
         ct = t - self.start  # clip time
 
-        clip_frame = self.get_frame(ct)
+        clip_frame = _as_numpy_if_cuda_array(self.get_frame(ct))
         if clip_frame.dtype != np.uint8:
             clip_frame = clip_frame.astype("uint8")
         background_height, background_width = background.shape[:2]
@@ -841,7 +897,7 @@ class VideoClip(Clip):
         clip_mask = None
 
         if self.mask is not None:
-            clip_mask = self.mask.get_frame(ct)
+            clip_mask = _as_numpy_if_cuda_array(self.mask.get_frame(ct))
 
             if clip_frame.shape[:2] != clip_mask.shape[:2]:
                 mask_height, mask_width = clip_mask.shape[:2]
@@ -1060,8 +1116,9 @@ class VideoClip(Clip):
         t:
           The time position in the clip at which to extract the mask.
         """
+        background_mask = _as_numpy_if_cuda_array(background_mask)
         ct = t - self.start  # clip time
-        clip_mask = self.get_frame(ct)
+        clip_mask = _as_numpy_if_cuda_array(self.get_frame(ct))
         if clip_mask.ndim == 3:
             clip_mask = clip_mask[:, :, 0]
         if not np.issubdtype(clip_mask.dtype, np.floating):
@@ -1112,8 +1169,9 @@ class VideoClip(Clip):
 
         When make_copy is False, background_mask may be modified in-place.
         """
+        background_mask = _as_numpy_if_cuda_array(background_mask)
         ct = t - self.start  # clip time
-        clip_mask = self.get_frame(ct)
+        clip_mask = _as_numpy_if_cuda_array(self.get_frame(ct))
         if clip_mask.ndim == 3:
             clip_mask = clip_mask[:, :, 0]
         if not np.issubdtype(clip_mask.dtype, np.floating):
@@ -1397,7 +1455,11 @@ class VideoClip(Clip):
         which can be expressed in seconds (15.35), in (min, sec),
         in (hour, min, sec), or as a string: '01:03:05.35'.
         """
-        new_clip = ImageClip(self.get_frame(t), is_mask=self.is_mask, duration=duration)
+        new_clip = ImageClip(
+            _as_numpy_if_cuda_array(self.get_frame(t)),
+            is_mask=self.is_mask,
+            duration=duration,
+        )
         if with_mask and self.mask is not None:
             new_clip.mask = self.mask.to_ImageClip(t)
         return new_clip
@@ -1617,6 +1679,10 @@ class ImageClip(VideoClip):
 
     def __init__(self, img, is_mask=False, transparent=True, duration=None):
         VideoClip.__init__(self, is_mask=is_mask, duration=duration)
+
+        # Accept CUDA arrays by downloading to NumPy. Public MoviePy frame API
+        # is NumPy-based; GPU residency is handled by internal fast paths.
+        img = _as_numpy_if_cuda_array(img)
 
         if not isinstance(img, np.ndarray):
             # img is a string or path-like object, so read it in from disk

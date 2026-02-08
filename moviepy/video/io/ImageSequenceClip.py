@@ -11,6 +11,17 @@ from imageio.v2 import imread
 from moviepy.video.VideoClip import VideoClip
 
 
+def _as_numpy_if_cuda_array(arr):
+    if arr is None or not hasattr(arr, "__cuda_array_interface__"):
+        return arr
+    try:
+        import cupy as cp
+
+        return cp.asnumpy(arr)
+    except Exception:
+        return arr
+
+
 class ImageSequenceClip(VideoClip):
     """A VideoClip made from a series of images.
 
@@ -227,6 +238,8 @@ class ImageSequenceClip(VideoClip):
             return self.last_image
         else:
             if self.is_mask:
-                return self.sequence[index][:, :, 3].astype(float) / 255.0
+                img = _as_numpy_if_cuda_array(self.sequence[index])
+                return img[:, :, 3].astype(float) / 255.0
             else:
-                return self.sequence[index][:, :, :3]
+                img = _as_numpy_if_cuda_array(self.sequence[index])
+                return img[:, :, :3]

@@ -5,6 +5,7 @@ import numpy as np
 from moviepy.Clip import Clip
 from moviepy.Effect import Effect
 from moviepy.video.VideoClip import ImageClip
+from moviepy.video.tools import cupy_utils
 
 
 @dataclass
@@ -53,18 +54,27 @@ class Margin(Effect):
         if self.margin_size is not None:
             self.left = self.right = self.top = self.bottom = self.margin_size
 
-        def make_bg(w, h):
-          new_w, new_h = w + self.left + self.right, h + self.top + self.bottom
-          if clip.is_mask:
-            bg = np.empty((new_h, new_w), dtype=float)
-            bg.fill(float(self.opacity))
-          else:
-            bg = np.empty((new_h, new_w, 3), dtype=np.uint8)
-            bg[...] = self.color
-          return bg
+        def make_bg(w, h, *, xp=None, is_cuda: bool = False):
+            new_w, new_h = w + self.left + self.right, h + self.top + self.bottom
+            if xp is None:
+                xp = np
+            if clip.is_mask:
+                dtype = xp.float64 if is_cuda else float
+                bg = xp.empty((new_h, new_w), dtype=dtype)
+                bg.fill(float(self.opacity))
+            else:
+                dtype = xp.uint8 if is_cuda else np.uint8
+                bg = xp.empty((new_h, new_w, 3), dtype=dtype)
+                bg[...] = self.color
+            return bg
 
         if isinstance(clip, ImageClip):
-            im = make_bg(clip.w, clip.h)
+            if cupy_utils.is_cuda_array(clip.img):
+                cp = cupy_utils.cupy()
+                im = make_bg(clip.w, clip.h, xp=cp, is_cuda=True)
+            else:
+                im = make_bg(clip.w, clip.h)
+
             im[self.top : self.top + clip.h, self.left : self.left + clip.w] = clip.img
             return clip.image_transform(lambda pic: im)
 
@@ -73,7 +83,13 @@ class Margin(Effect):
             def filter(get_frame, t):
                 pic = get_frame(t)
                 h, w = pic.shape[:2]
-                im = make_bg(w, h)
+
+                if cupy_utils.is_cuda_array(pic):
+                    cp = cupy_utils.cupy()
+                    im = make_bg(w, h, xp=cp, is_cuda=True)
+                else:
+                    im = make_bg(w, h)
+
                 im[self.top : self.top + h, self.left : self.left + w] = pic
                 return im
 

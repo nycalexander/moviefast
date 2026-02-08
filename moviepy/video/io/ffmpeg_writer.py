@@ -297,6 +297,16 @@ def ffmpeg_write_video(
 
     logger(message="MoviePy - Writing video %s\n" % filename)
 
+    def _as_numpy_if_cuda_array(arr):
+        if arr is None or not hasattr(arr, "__cuda_array_interface__"):
+            return arr
+        try:
+            import cupy as cp
+
+            return cp.asnumpy(arr)
+        except Exception:
+            return arr
+
     has_mask = clip.mask is not None
 
     # Experimental GPU render: keep compositing math on GPU (CuPy) and download
@@ -305,6 +315,33 @@ def ffmpeg_write_video(
         from moviepy.video.tools import gpu_render
     except Exception:
         gpu_render = None
+
+    # Best-effort GPU-native encode (NVENC) using PyNvCodec, with FFmpeg for mux.
+    if (gpu_render is not None) and gpu_render.is_enabled() and gpu_render.is_available():
+        try:
+            from moviepy.video.io.pynvcodec_writer import try_write_video_pynvcodec
+
+            wrote = try_write_video_pynvcodec(
+                clip=clip,
+                filename=filename,
+                fps=fps,
+                codec=codec,
+                bitrate=bitrate,
+                preset=preset,
+                audiofile=audiofile,
+                audio_codec=audio_codec,
+                logger=logger,
+                gpu_render=gpu_render,
+                pixel_format=pixel_format,
+            )
+            if wrote:
+                if write_logfile:
+                    logfile.close()
+                logger(message="MoviePy - Done !")
+                return
+        except Exception:
+            # Any failure here should fall back to the standard writer.
+            pass
 
     with FFMPEG_VideoWriter(
         filename,
@@ -335,7 +372,9 @@ def ffmpeg_write_video(
                 logger=logger, with_times=True, fps=fps, dtype=np.uint8
             ):
                 if has_mask:
-                    mask = 255 * clip.mask.get_frame(t)
+                    frame = _as_numpy_if_cuda_array(frame)
+                    mask = _as_numpy_if_cuda_array(clip.mask.get_frame(t))
+                    mask = 255 * mask
                     if mask.dtype != np.uint8:
                         mask = mask.astype(np.uint8)
                     frame = np.dstack([frame, mask])

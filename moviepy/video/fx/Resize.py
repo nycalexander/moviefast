@@ -5,6 +5,7 @@ from typing import Union
 import cv2
 
 from moviepy.Effect import Effect
+from moviepy.video.tools import cupy_utils
 
 
 @dataclass
@@ -46,6 +47,11 @@ class Resize(Effect):
 
     def resizer(self, pic, new_size):
         """Resize the image using openCV."""
+        cp = None
+        if cupy_utils.is_cuda_array(pic):
+            cp = cupy_utils.cupy()
+            pic = cp.asnumpy(pic)
+
         lx, ly = int(new_size[0]), int(new_size[1])
         if lx > pic.shape[1] or ly > pic.shape[0]:
             # For upsizing use linear for good quality & decent speed
@@ -53,7 +59,11 @@ class Resize(Effect):
         else:
             # For dowsizing use area to prevent aliasing
             interpolation = cv2.INTER_AREA
-        return cv2.resize(+pic.astype("uint8"), (lx, ly), interpolation=interpolation)
+
+        resized = cv2.resize(+pic.astype("uint8"), (lx, ly), interpolation=interpolation)
+        if cp is not None:
+            return cp.asarray(resized)
+        return resized
 
     def apply(self, clip):
         """Apply the effect to the clip."""

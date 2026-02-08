@@ -11,51 +11,9 @@ Keeping whole-frame state on the GPU would require broader architectural changes
 from __future__ import annotations
 
 import os
-import site
 from typing import Any
 
-
-_CUPY_USABLE: bool | None = None
-
-
-def _windows_cuda_dll_setup() -> None:
-    """Best-effort CUDA DLL setup for Windows."""
-    if os.name != "nt":
-        return
-
-    cuda_root = os.environ.get("CUDA_PATH") or os.environ.get("CUDA_HOME")
-    if not cuda_root:
-        versioned = [(k, v) for k, v in os.environ.items() if k.startswith("CUDA_PATH_V") and v]
-        if versioned:
-            cuda_root = sorted(versioned, key=lambda kv: kv[0])[-1][1]
-            os.environ.setdefault("CUDA_PATH", cuda_root)
-
-    candidates: list[str] = []
-    if cuda_root:
-        candidates.extend(
-            [
-                os.path.join(cuda_root, "bin"),
-                os.path.join(cuda_root, "bin", "x64"),
-                os.path.join(cuda_root, "bin", "x86_64"),
-            ]
-        )
-
-    for sp in site.getsitepackages():
-        candidates.extend(
-            [
-                os.path.join(sp, "nvidia", "cu13", "bin"),
-                os.path.join(sp, "nvidia", "cu13", "bin", "x86_64"),
-                os.path.join(sp, "nvidia", "cu12", "bin"),
-                os.path.join(sp, "nvidia", "cu12", "bin", "x86_64"),
-            ]
-        )
-
-    for d in candidates:
-        try:
-            if d and os.path.isdir(d):
-                os.add_dll_directory(d)
-        except Exception:
-            pass
+from moviepy.video.tools import cupy_utils
 
 
 def _env_flag(name: str, default: str = "0") -> bool:
@@ -74,35 +32,7 @@ def is_available() -> bool:
 
 
 def _has_cupy() -> bool:
-    global _CUPY_USABLE
-    if _CUPY_USABLE is not None:
-        return bool(_CUPY_USABLE)
-
-    try:
-        _windows_cuda_dll_setup()
-        import cupy as cp
-
-        try:
-            if int(cp.cuda.runtime.getDeviceCount()) <= 0:
-                return False
-        except Exception:
-            # Be permissive; we'll validate by running a tiny op.
-            pass
-
-        try:
-            a = cp.zeros((1,), dtype=cp.uint8)
-            b = a.astype(cp.float32)
-            b += 1.0
-            cp.cuda.runtime.deviceSynchronize()
-        except Exception:
-            _CUPY_USABLE = False
-            return False
-
-        _CUPY_USABLE = True
-        return True
-    except Exception:
-        _CUPY_USABLE = False
-        return False
+    return cupy_utils.is_cupy_usable()
 
 
 def _has_opencv_cuda() -> bool:
@@ -137,10 +67,7 @@ def should_use_gpu(h: int, w: int) -> bool:
 
 
 def _cp() -> Any:
-    _windows_cuda_dll_setup()
-    import cupy as cp
-
-    return cp
+    return cupy_utils.cupy()
 
 
 def _try_run_opencv_cuda(fn):

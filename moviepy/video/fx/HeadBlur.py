@@ -5,6 +5,7 @@ import numpy as np
 
 from moviepy.Clip import Clip
 from moviepy.Effect import Effect
+from moviepy.video.tools import cupy_utils
 
 
 @dataclass
@@ -26,7 +27,12 @@ class HeadBlur(Effect):
             self.intensity = int(2 * self.radius / 3)
 
         def filter(get_frame, t):
-            im = get_frame(t).copy()
+            im = get_frame(t)
+            is_cuda = cupy_utils.is_cuda_array(im)
+            cp = cupy_utils.cupy() if is_cuda else None
+            if is_cuda:
+                im = cp.asnumpy(im)
+            im = im.copy()
             h, w, d = im.shape
             x, y = int(self.fx(t)), int(self.fy(t))
             # Create a mask for the blur area
@@ -47,6 +53,7 @@ class HeadBlur(Effect):
             blur_mask = cv2.cvtColor(blur_mask, cv2.COLOR_GRAY2BGR)
 
             res = np.where(blur_mask == 255, blurred_im, im)
-            return np.array(res, dtype=np.uint8)
+            res = np.array(res, dtype=np.uint8)
+            return cp.asarray(res) if is_cuda else res
 
         return clip.transform(filter)

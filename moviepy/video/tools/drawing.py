@@ -5,6 +5,17 @@ methods that are difficult to do with the existing Python libraries.
 import numpy as np
 
 
+def _as_numpy_if_cuda_array(obj):
+    if hasattr(obj, "__cuda_array_interface__"):
+        try:
+            import cupy as cp
+
+            return cp.asnumpy(obj)
+        except Exception:
+            return obj
+    return obj
+
+
 def color_gradient(
     size,
     p1,
@@ -109,6 +120,12 @@ def color_gradient(
     """
     # np-arrayize and change x,y coordinates to y,x
     w, h = size
+
+    color_1 = _as_numpy_if_cuda_array(color_1)
+    color_2 = _as_numpy_if_cuda_array(color_2)
+    p1 = _as_numpy_if_cuda_array(p1)
+    p2 = _as_numpy_if_cuda_array(p2)
+    vector = _as_numpy_if_cuda_array(vector)
 
     color_1 = np.array(color_1).astype(float)
     color_2 = np.array(color_2).astype(float)
@@ -239,6 +256,12 @@ def color_split(
         # An image split along an arbitrary line (see below)
         color_split(size, p1=[20, 50], p2=[25, 70], color_1=0, color_2=1)
     """
+    color_1 = _as_numpy_if_cuda_array(color_1)
+    color_2 = _as_numpy_if_cuda_array(color_2)
+    p1 = _as_numpy_if_cuda_array(p1)
+    p2 = _as_numpy_if_cuda_array(p2)
+    vector = _as_numpy_if_cuda_array(vector)
+
     if gradient_width or ((x is None) and (y is None)):
         if p2 is not None:
             vector = np.array(p2) - np.array(p1)

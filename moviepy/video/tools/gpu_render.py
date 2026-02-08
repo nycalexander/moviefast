@@ -10,12 +10,13 @@ It is used opportunistically by ffmpeg_write_video when enabled.
 from __future__ import annotations
 
 import os
-import site
 from typing import Tuple
+import weakref
 
 import numpy as np
 
 from moviepy.tools import compute_position
+from moviepy.video.tools import cupy_utils
 
 
 def _env_flag(name: str, default: str = "0") -> bool:
@@ -27,104 +28,10 @@ def _strict() -> bool:
     return _env_flag("MOVIEPY_GPU_RENDER_STRICT", "0")
 
 
-_CUPY_USABLE: bool | None = None
-
-
-def _windows_cuda_dll_setup() -> None:
-    """Best-effort CUDA DLL setup for Windows.
-
-    CuPy may import successfully but fail later when it needs NVRTC DLLs.
-    Adding CUDA Toolkit / pip-runtime DLL directories helps DLL resolution.
-    """
-    if os.name != "nt":
-        return
-
-    # Prefer explicit CUDA_PATH.
-    cuda_root = os.environ.get("CUDA_PATH") or os.environ.get("CUDA_HOME")
-
-    # Some installations set versioned variables (e.g. CUDA_PATH_V13_0).
-    if not cuda_root:
-        versioned = [(k, v) for k, v in os.environ.items() if k.startswith("CUDA_PATH_V") and v]
-        if versioned:
-            # Pick the highest lexicographic key (good enough for V<major>_<minor>).
-            cuda_root = sorted(versioned, key=lambda kv: kv[0])[-1][1]
-            os.environ.setdefault("CUDA_PATH", cuda_root)
-
-    candidates: list[str] = []
-    if cuda_root:
-        candidates.extend(
-            [
-                os.path.join(cuda_root, "bin"),
-                os.path.join(cuda_root, "bin", "x64"),
-                os.path.join(cuda_root, "bin", "x86_64"),
-            ]
-        )
-
-    # Also consider pip-installed NVIDIA runtime layout (if present).
-    for sp in site.getsitepackages():
-        candidates.extend(
-            [
-                os.path.join(sp, "nvidia", "cu13", "bin"),
-                os.path.join(sp, "nvidia", "cu13", "bin", "x86_64"),
-                os.path.join(sp, "nvidia", "cu12", "bin"),
-                os.path.join(sp, "nvidia", "cu12", "bin", "x86_64"),
-            ]
-        )
-
-    for d in candidates:
-        try:
-            if d and os.path.isdir(d):
-                os.add_dll_directory(d)
-        except Exception:
-            pass
-
-
-def _cp():
-    _windows_cuda_dll_setup()
-    import cupy as cp
-
-    return cp
-
-
-def _cupy_is_usable(cp) -> bool:
-    """Return True if CuPy can actually execute kernels.
-
-    Some installations can import CuPy and even see a device, but fail at runtime
-    due to missing CUDA/NVRTC DLLs (common on Windows if PATH isn't set up).
-    """
-    try:
-        # Device query
-        try:
-            if int(cp.cuda.runtime.getDeviceCount()) <= 0:
-                return False
-        except Exception:
-            # Be permissive; the real check is executing a kernel.
-            pass
-
-        # Minimal kernel compile/launch check.
-        a = cp.zeros((1,), dtype=cp.uint8)
-        b = a.astype(cp.float32)
-        b += 1.0
-        cp.cuda.runtime.deviceSynchronize()
-        return True
-    except Exception:
-        return False
-
-
 def is_available() -> bool:
-    global _CUPY_USABLE
-    if _CUPY_USABLE is not None:
-        return bool(_CUPY_USABLE)
     if _env_flag("MOVIEPY_DISABLE_GPU", "0"):
-        _CUPY_USABLE = False
         return False
-    try:
-        cp = _cp()
-        _CUPY_USABLE = bool(_cupy_is_usable(cp))
-        return bool(_CUPY_USABLE)
-    except Exception:
-        _CUPY_USABLE = False
-        return False
+    return cupy_utils.is_cupy_usable()
 
 
 def is_enabled() -> bool:
@@ -149,12 +56,146 @@ def is_enabled() -> bool:
 
 
 def _is_gpu_array(x) -> bool:
-    # CuPy (and many CUDA array libs) expose this.
-    return hasattr(x, "__cuda_array_interface__")
+    return cupy_utils.is_cuda_array(x)
+
+
+_IMAGE_U8_CACHE: dict[int, tuple[weakref.ref, object]] = {}
+_MASK_F32_CACHE: dict[int, tuple[weakref.ref, object]] = {}
+
+
+def _get_frame_gpu_best_effort(clip, t):
+    """Return a CuPy array for clip.get_frame(t), best-effort.
+
+    Prefers the internal `_gpu_frame_function` attribute (if present), which
+    can keep effect chains on the GPU. Falls back to CPU get_frame upload.
+    """
+    cp = cupy_utils.cupy()
+
+    gpu_fn = getattr(clip, "_gpu_frame_function", None)
+    if gpu_fn is not None:
+        try:
+            out = gpu_fn(t)
+            return out if _is_gpu_array(out) else cp.asarray(out)
+        except Exception:
+            if _strict():
+                raise
+
+    out = clip.get_frame(t)
+    return out if _is_gpu_array(out) else cp.asarray(out)
+
+
+def _get_mask_frame_gpu_best_effort(mask_clip, t):
+    """Return a CuPy 2D mask frame, preserving dtype when possible."""
+    cp = cupy_utils.cupy()
+    m = _get_frame_gpu_best_effort(mask_clip, t)
+    m = m if _is_gpu_array(m) else cp.asarray(m)
+    if m.ndim == 3:
+        m = m[:, :, 0]
+    return m
+
+
+def _cache_get(cache: dict[int, tuple[weakref.ref, object]], clip) -> object | None:
+    key = id(clip)
+    entry = cache.get(key)
+    if entry is None:
+        return None
+    clip_ref, value = entry
+    if clip_ref() is clip:
+        return value
+    # Stale id reused; drop.
+    try:
+        del cache[key]
+    except Exception:
+        pass
+    return None
+
+
+def _cache_set(cache: dict[int, tuple[weakref.ref, object]], clip, value: object) -> None:
+    key = id(clip)
+
+    def _cleanup(_ref, _key=key, _cache=cache):
+        try:
+            _cache.pop(_key, None)
+        except Exception:
+            pass
+
+    cache[key] = (weakref.ref(clip, _cleanup), value)
+
+
+def _cached_cp_u8_rgb_for_imageclip(clip):
+    cp = cupy_utils.cupy()
+    cached = _cache_get(_IMAGE_U8_CACHE, clip)
+    if cached is not None:
+        return cached
+    arr = clip.img
+
+    if _is_gpu_array(arr):
+        a = arr
+        if a.ndim == 2:
+            a = cp.stack([a, a, a], axis=2)
+        if a.ndim == 3 and a.shape[2] >= 3:
+            a = a[:, :, :3]
+        if a.dtype != cp.uint8:
+            a = a.astype(cp.uint8)
+        try:
+            if not a.flags.c_contiguous:
+                a = cp.ascontiguousarray(a)
+        except Exception:
+            # Best-effort; if flags isn't available, just proceed.
+            pass
+        _cache_set(_IMAGE_U8_CACHE, clip, a)
+        return a
+
+    # Ensure we only cache immutable-by-convention ImageClip/ColorClip backing arrays.
+    if arr.dtype != np.uint8:
+        arr = arr.astype(np.uint8)
+    if arr.ndim == 2:
+        arr = np.dstack([arr, arr, arr])
+    if arr.ndim == 3 and arr.shape[2] >= 3:
+        arr = arr[:, :, :3]
+    if not arr.flags["C_CONTIGUOUS"]:
+        arr = np.ascontiguousarray(arr)
+    cached_arr = cp.asarray(arr)
+    _cache_set(_IMAGE_U8_CACHE, clip, cached_arr)
+    return cached_arr
+
+
+def _cached_cp_f32_mask_for_imageclip(clip):
+    cp = cupy_utils.cupy()
+    cached = _cache_get(_MASK_F32_CACHE, clip)
+    if cached is not None:
+        return cached
+    arr = clip.img
+
+    if _is_gpu_array(arr):
+        a = arr
+        if a.ndim == 3:
+            a = a[:, :, 0]
+        if a.dtype != cp.float32:
+            a = a.astype(cp.float32)
+        try:
+            if not a.flags.c_contiguous:
+                a = cp.ascontiguousarray(a)
+        except Exception:
+            pass
+        _cache_set(_MASK_F32_CACHE, clip, a)
+        return a
+
+    if isinstance(arr, np.ndarray) and arr.ndim == 3:
+        arr = arr[:, :, 0]
+    if not isinstance(arr, np.ndarray):
+        arr = np.asarray(arr)
+    if arr.dtype != np.float32:
+        arr = arr.astype(np.float32)
+    if not arr.flags["C_CONTIGUOUS"]:
+        arr = np.ascontiguousarray(arr)
+    cached_arr = cp.asarray(arr)
+    _cache_set(_MASK_F32_CACHE, clip, cached_arr)
+    return cached_arr
 
 
 def _to_cp_u8_rgb(frame):
-    cp = _cp()
+    cp = cupy_utils.cupy()
     f = frame if _is_gpu_array(frame) else cp.asarray(frame)
     if f.ndim == 2:
         f = cp.stack([f, f, f], axis=2)
@@ -166,12 +207,22 @@ def _to_cp_u8_rgb(frame):
 
 
 def _to_cp_f32_mask(mask):
-    cp = _cp()
+    cp = cupy_utils.cupy()
     m = mask if _is_gpu_array(mask) else cp.asarray(mask)
     if m.ndim == 3:
         m = m[:, :, 0]
     if m.dtype != cp.float32:
         m = m.astype(cp.float32)
+    return m
+
+
+def _to_cp_mask(mask, dtype):
+    cp = cupy_utils.cupy()
+    m = mask if _is_gpu_array(mask) else cp.asarray(mask)
+    if m.ndim == 3:
+        m = m[:, :, 0]
+    if m.dtype != dtype:
+        m = m.astype(dtype)
     return m
 
 
@@ -217,33 +268,60 @@ def _coords_for_layer(
 
 def _composite_rgb_gpu(clip, t):
     """Return a CuPy uint8 RGB frame for a (possibly composite) clip."""
-    cp = _cp()
+    cp = cupy_utils.cupy()
 
     # CompositeVideoClip path
     from moviepy.video.compositing.CompositeVideoClip import CompositeVideoClip
+    from moviepy.video.VideoClip import ImageClip, ColorClip
 
     if isinstance(clip, CompositeVideoClip):
         playing = clip.playing_clips(t)
 
+        # Fast-path: if no playing layer has a mask, we can composite entirely
+        # in uint8 (no alpha blending), avoiding a full-frame float32 buffer.
+        any_layer_has_mask = any(getattr(layer, "mask", None) is not None for layer in playing)
+
         bg_t = t - clip.bg.start
-        bg_u8 = _to_cp_u8_rgb(clip.bg.get_frame(bg_t))
-        bg_f = bg_u8.astype(cp.float32)
+        if isinstance(clip.bg, CompositeVideoClip):
+            bg_u8 = _composite_rgb_gpu(clip.bg, bg_t)
+        elif isinstance(clip.bg, (ImageClip, ColorClip)) and hasattr(clip.bg, "img"):
+            bg_u8 = _cached_cp_u8_rgb_for_imageclip(clip.bg)
+        else:
+            bg_u8 = _to_cp_u8_rgb(_get_frame_gpu_best_effort(clip.bg, bg_t))
+
+        bg_f = None
 
         bg_mask_f = None
-        if clip.bg.mask:
+        if clip.bg.mask and any_layer_has_mask:
             bgm_t = t - clip.bg.mask.start
-            bg_mask_f = _to_cp_f32_mask(clip.bg.mask.get_frame(bgm_t))
+            if isinstance(clip.bg.mask, (ImageClip, ColorClip)) and getattr(
+                clip.bg.mask, "is_mask", False
+            ) and hasattr(clip.bg.mask, "img"):
+                bg_mask_f = _cached_cp_f32_mask_for_imageclip(clip.bg.mask)
+            else:
+                bg_mask_f = _composite_mask_gpu(clip.bg.mask, bgm_t, dtype=cp.float32)
 
         bg_h, bg_w = int(bg_u8.shape[0]), int(bg_u8.shape[1])
 
         for layer in playing:
             ct = t - layer.start
-            fr_u8 = _to_cp_u8_rgb(layer.get_frame(ct))
-            fr_f = fr_u8.astype(cp.float32)
+            if isinstance(layer, CompositeVideoClip):
+                fr_u8 = _composite_rgb_gpu(layer, ct)
+            elif isinstance(layer, (ImageClip, ColorClip)) and hasattr(layer, "img"):
+                fr_u8 = _cached_cp_u8_rgb_for_imageclip(layer)
+            else:
+                fr_u8 = _to_cp_u8_rgb(_get_frame_gpu_best_effort(layer, ct))
 
-            layer_mask_f = None
+            layer_mask = None
             if layer.mask is not None:
-                layer_mask_f = _to_cp_f32_mask(layer.mask.get_frame(ct))
+                if isinstance(layer.mask, (ImageClip, ColorClip)) and getattr(
+                    layer.mask, "is_mask", False
+                ) and hasattr(layer.mask, "img"):
+                    layer_mask = _cached_cp_f32_mask_for_imageclip(layer.mask)
+                elif isinstance(layer.mask, CompositeVideoClip) and getattr(layer.mask, "is_mask", False):
+                    layer_mask = _composite_mask_gpu(layer.mask, ct, dtype=cp.float32)
+                else:
+                    layer_mask = _get_mask_frame_gpu_best_effort(layer.mask, ct)
 
             pos = layer.pos(ct)
             x_start, y_start = compute_position(
@@ -266,17 +344,28 @@ def _composite_rgb_gpu(clip, t):
 
             if (y2_bg <= y1_bg) or (x2_bg <= x1_bg):
                 continue
+            fr_u8_region = fr_u8[y1_clip:y2_clip, x1_clip:x2_clip]
 
-            bg_region = bg_f[y1_bg:y2_bg, x1_bg:x2_bg]
-            fr_region = fr_f[y1_clip:y2_clip, x1_clip:x2_clip]
-
-            if layer_mask_f is None:
-                bg_region[...] = fr_region
+            if layer_mask is None:
+                if bg_f is None:
+                    bg_u8[y1_bg:y2_bg, x1_bg:x2_bg] = fr_u8_region
+                else:
+                    bg_region = bg_f[y1_bg:y2_bg, x1_bg:x2_bg]
+                    bg_region[...] = fr_u8_region
                 if bg_mask_f is not None:
                     bg_mask_f[y1_bg:y2_bg, x1_bg:x2_bg] = 1.0
                 continue
 
-            a = layer_mask_f[y1_clip:y2_clip, x1_clip:x2_clip]
+            # First masked layer triggers float32 compositing.
+            if bg_f is None:
+                bg_f = bg_u8.astype(cp.float32)
+
+            bg_region = bg_f[y1_bg:y2_bg, x1_bg:x2_bg]
+
+            a = layer_mask[y1_clip:y2_clip, x1_clip:x2_clip]
+            if a.dtype != cp.float32:
+                a = a.astype(cp.float32)
+            fr_region = fr_u8_region.astype(cp.float32)
 
             if bg_mask_f is None:
                 # bg = bg + a*(fr - bg)
@@ -299,28 +388,47 @@ def _composite_rgb_gpu(clip, t):
 
                 bg_a[...] = final_a
 
+        if bg_f is None:
+            return bg_u8
+
         cp.rint(bg_f, out=bg_f)
         cp.clip(bg_f, 0, 255, out=bg_f)
         return bg_f.astype(cp.uint8)
 
-    # Non-composite: upload current frame.
-    return _to_cp_u8_rgb(clip.get_frame(t))
+    # Non-composite: keep static ImageClips on GPU without re-upload.
+    if isinstance(clip, (ImageClip, ColorClip)) and hasattr(clip, "img"):
+        return _cached_cp_u8_rgb_for_imageclip(clip)
+    return _to_cp_u8_rgb(_get_frame_gpu_best_effort(clip, t))
 
 
-def _composite_mask_gpu(mask_clip, t):
-    """Return a CuPy float32 mask frame."""
-    cp = _cp()
+def _composite_mask_gpu(mask_clip, t, *, dtype=None):
+    """Return a CuPy floating mask frame.
+
+    For parity with CPU semantics:
+    - CompositeVideoClip masks are computed in float64 on CPU, so callers that
+      care about exact export rounding should request float64.
+    - Alpha blending inside RGB compositing uses float32 on CPU.
+    """
+    cp = cupy_utils.cupy()
+    if dtype is None:
+        dtype = cp.float32
 
     from moviepy.video.compositing.CompositeVideoClip import CompositeVideoClip
+    from moviepy.video.VideoClip import ImageClip, ColorClip
 
     if isinstance(mask_clip, CompositeVideoClip) and mask_clip.is_mask:
-        # Background mask is zeros
         h, w = mask_clip.size[1], mask_clip.size[0]
-        b = cp.zeros((h, w), dtype=cp.float32)
+        b = cp.zeros((h, w), dtype=dtype)
 
         for layer in mask_clip.playing_clips(t):
             ct = t - layer.start
-            m = _to_cp_f32_mask(layer.get_frame(ct))
+            if isinstance(layer, CompositeVideoClip) and getattr(layer, "is_mask", False):
+                m = _composite_mask_gpu(layer, ct, dtype=dtype)
+            else:
+                m = _get_frame_gpu_best_effort(layer, ct)
+                m = m if _is_gpu_array(m) else cp.asarray(m)
+                if m.ndim == 3:
+                    m = m[:, :, 0]
 
             pos = layer.pos(ct)
             x_start, y_start = compute_position(
@@ -339,13 +447,17 @@ def _composite_mask_gpu(mask_clip, t):
                 y2_clip,
                 x1_clip,
                 x2_clip,
-            ) = _coords_for_layer((w, h), (int(m.shape[1]), int(m.shape[0])), x_start, y_start)
+            ) = _coords_for_layer(
+                (w, h), (int(m.shape[1]), int(m.shape[0])), x_start, y_start
+            )
 
             if (y2_bg <= y1_bg) or (x2_bg <= x1_bg):
                 continue
 
             b_region = b[y1_bg:y2_bg, x1_bg:x2_bg]
             m_region = m[y1_clip:y2_clip, x1_clip:x2_clip]
+            if m_region.dtype != dtype:
+                m_region = m_region.astype(dtype)
 
             # b = m + b*(1-m)
             b_region *= (1.0 - m_region)
@@ -353,8 +465,17 @@ def _composite_mask_gpu(mask_clip, t):
 
         return b
 
-    # Non-composite mask: upload.
-    return _to_cp_f32_mask(mask_clip.get_frame(t))
+    if (
+        isinstance(mask_clip, (ImageClip, ColorClip))
+        and getattr(mask_clip, "is_mask", False)
+        and hasattr(mask_clip, "img")
+    ):
+        m = _cached_cp_f32_mask_for_imageclip(mask_clip)
+        if dtype != cp.float32:
+            m = m.astype(dtype)
+        return m
+
+    return _to_cp_mask(_get_frame_gpu_best_effort(mask_clip, t), dtype)
 
 
 def get_frame_for_export_uint8(clip, t: float):
@@ -370,7 +491,7 @@ def get_frame_for_export_uint8(clip, t: float):
             frame = frame.astype(np.uint8)
         return frame
 
-    cp = _cp()
+    cp = cupy_utils.cupy()
 
     try:
         rgb_u8 = _composite_rgb_gpu(clip, t)
@@ -380,8 +501,13 @@ def get_frame_for_export_uint8(clip, t: float):
         # Match CPU export path semantics exactly:
         # mask_u8 = (255 * mask_frame).astype(uint8) with NumPy/CuPy overflow
         # behavior for uint8 masks, and stack via dstack semantics.
-        mask_frame = clip.mask.get_frame(t)
-        m = mask_frame if _is_gpu_array(mask_frame) else cp.asarray(mask_frame)
+        from moviepy.video.compositing.CompositeVideoClip import CompositeVideoClip
+
+        if isinstance(clip.mask, CompositeVideoClip) and getattr(clip.mask, "is_mask", False):
+            m = _composite_mask_gpu(clip.mask, t, dtype=cp.float64)
+        else:
+            m = _get_frame_gpu_best_effort(clip.mask, t)
+            m = m if _is_gpu_array(m) else cp.asarray(m)
         m_u8 = m * 255
         if m_u8.dtype != cp.uint8:
             m_u8 = m_u8.astype(cp.uint8)
@@ -424,7 +550,7 @@ def get_frame_for_export_uint8_gpu(clip, t: float):
             frame = np.dstack([frame, mask])
         return frame
 
-    cp = _cp()
+    cp = cupy_utils.cupy()
     try:
         rgb_u8 = _composite_rgb_gpu(clip, t)
         if clip.mask is None:
@@ -433,8 +559,13 @@ def get_frame_for_export_uint8_gpu(clip, t: float):
         # Match CPU export path semantics exactly:
         # mask_u8 = (255 * mask_frame).astype(uint8) with CuPy overflow
         # behavior for uint8 masks, and stack via dstack semantics.
-        mask_frame = clip.mask.get_frame(t)
-        m = mask_frame if _is_gpu_array(mask_frame) else cp.asarray(mask_frame)
+        from moviepy.video.compositing.CompositeVideoClip import CompositeVideoClip
+
+        if isinstance(clip.mask, CompositeVideoClip) and getattr(clip.mask, "is_mask", False):
+            m = _composite_mask_gpu(clip.mask, t, dtype=cp.float64)
+        else:
+            m = _get_frame_gpu_best_effort(clip.mask, t)
+            m = m if _is_gpu_array(m) else cp.asarray(m)
         m_u8 = m * 255
         if m_u8.dtype != cp.uint8:
             m_u8 = m_u8.astype(cp.uint8)

@@ -125,6 +125,58 @@ class VideoFileClip(VideoClip):
             print_infos=False,
         )
 
+        def _env_flag(name: str, default: str = "0") -> bool:
+            val = os.environ.get(name, default)
+            return str(val).strip().lower() not in {"0", "false", "no", "off", ""}
+
+        def _try_make_true_gpu_reader():
+            """Best-effort GPU-resident decode reader.
+
+            This is internal-only and should never change public MoviePy APIs.
+            It only activates when the experimental GPU render path is enabled.
+            """
+            if _env_flag("MOVIEPY_DISABLE_GPU_DECODE", "0"):
+                raise RuntimeError("GPU decode disabled")
+
+            # Keep alpha/mask semantics conservative; GPU decode backends
+            # typically don't preserve alpha.
+            if has_mask or is_mask:
+                raise RuntimeError("GPU decode not used for alpha/mask clips")
+
+            if str(pixel_format).lower() != "rgb24":
+                raise RuntimeError("GPU decode backend only supports rgb24")
+
+            # If the caller asked ffmpeg to resize, preserve that behavior by
+            # using the existing readers.
+            if (target_resolution is not None) and (None in target_resolution):
+                raise RuntimeError("GPU decode backend requires explicit target_resolution")
+
+            # Only opt-in when GPU render is enabled (best-effort).
+            from moviepy.video.tools import gpu_render
+
+            if not (gpu_render.is_enabled() and gpu_render.is_available()):
+                raise RuntimeError("GPU render not enabled")
+
+            backend = (os.getenv("MOVIEPY_GPU_DECODE_BACKEND") or "auto").strip().lower()
+            if backend in {"0", "false", "off", "none", "disable", "disabled"}:
+                raise RuntimeError("GPU decode backend disabled")
+
+            # Auto backend: try decord first.
+            if backend in {"auto", "decord", "nvdec"}:
+                from moviepy.video.io.decord_gpu_reader import DecordGPUVideoReader
+
+                ctx_id = int(os.getenv("MOVIEPY_GPU_DEVICE", "0"))
+                return DecordGPUVideoReader(
+                    filename,
+                    infos=infos,
+                    target_resolution=target_resolution,
+                    pixel_format=pixel_format,
+                    resize_algo=resize_algorithm,
+                    ctx_id=ctx_id,
+                )
+
+            raise RuntimeError(f"Unknown MOVIEPY_GPU_DECODE_BACKEND={backend!r}")
+
         def _make_ffmpeg_reader():
             return FFMPEG_VideoReader(
                 filename,
@@ -173,16 +225,30 @@ class VideoFileClip(VideoClip):
             and (pixel_format.lower() == "rgb24")
         )
 
-        if (force_opencv or is_auto) and can_use_opencv:
+        # Optional true GPU decode backend (no ffmpeg stdout pipe), only in auto
+        # mode or when explicitly requested.
+        force_true_gpu = backend in {"gpu", "cuda", "nvdec", "decord"}
+
+        if force_true_gpu or is_auto:
             try:
-                self.reader = _try_make_opencv_reader()
+                self.reader = _try_make_true_gpu_reader()
             except Exception:
+                self.reader = None
+
+        if self.reader is None:
+            if (force_opencv or is_auto) and can_use_opencv:
+                try:
+                    self.reader = _try_make_opencv_reader()
+                except Exception:
+                    self.reader = _make_ffmpeg_reader()
+            elif force_ffmpeg:
                 self.reader = _make_ffmpeg_reader()
-        elif force_ffmpeg:
-            self.reader = _make_ffmpeg_reader()
-        else:
-            # Unknown backend value; be conservative.
-            self.reader = _make_ffmpeg_reader()
+            elif force_true_gpu:
+                # Explicit request but unavailable; be conservative.
+                self.reader = _make_ffmpeg_reader()
+            else:
+                # Unknown backend value; be conservative.
+                self.reader = _make_ffmpeg_reader()
 
         # Make some of the reader's attributes accessible from the clip
         self.duration = self.reader.duration
@@ -207,6 +273,14 @@ class VideoFileClip(VideoClip):
 
         else:
             self.frame_function = lambda t: self.reader.get_frame(t)
+
+        # Internal GPU frame function: if the reader can provide GPU frames,
+        # expose it for the experimental GPU compositor/export path.
+        if hasattr(self.reader, "get_frame_gpu"):
+            try:
+                self._gpu_frame_function = lambda t: self.reader.get_frame_gpu(t)
+            except Exception:
+                pass
 
         # Make a reader for the audio, if any.
         if audio and self.reader.infos["audio_found"]:

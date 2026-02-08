@@ -131,6 +131,40 @@ class Clip:
         # mf = copy(self.frame_function)
         new_clip = self.with_updated_frame_function(lambda t: func(self.get_frame, t))
 
+        # Best-effort internal GPU frame-function propagation.
+        #
+        # If the experimental GPU render path is enabled, it can use this to keep
+        # effect chains on the GPU when their operations are CuPy-aware.
+        #
+        # This never changes public APIs and is only used opportunistically.
+        try:
+            def _gpu_frame_function(t):
+                from moviepy.video.tools import cupy_utils
+
+                cp = cupy_utils.cupy()
+
+                def _gf(tt):
+                    src_gpu_fn = getattr(self, "_gpu_frame_function", None)
+                    if src_gpu_fn is not None:
+                        try:
+                            v = src_gpu_fn(tt)
+                            return v if cupy_utils.is_cuda_array(v) else cp.asarray(v)
+                        except Exception:
+                            pass
+                    return cp.asarray(self.get_frame(tt))
+
+                try:
+                    out = func(_gf, t)
+                except Exception:
+                    # Fallback: compute on CPU, then upload.
+                    out = func(self.get_frame, t)
+
+                return out if cupy_utils.is_cuda_array(out) else cp.asarray(out)
+
+            new_clip._gpu_frame_function = _gpu_frame_function
+        except Exception:
+            pass
+
         if not keep_duration:
             new_clip.duration = None
             new_clip.end = None
@@ -570,6 +604,16 @@ class Clip:
             t = np.float64(frame_index) / fps
 
             frame = self.get_frame(t)
+
+            # Public API: iter_frames yields NumPy arrays. If a clip returns
+            # a CuPy/CUDA array internally, download it best-effort here.
+            if hasattr(frame, "__cuda_array_interface__"):
+                try:
+                    import cupy as cp
+
+                    frame = cp.asnumpy(frame)
+                except Exception:
+                    pass
             if (target_dtype is not None) and (frame.dtype != target_dtype):
                 frame = frame.astype(target_dtype)
 
