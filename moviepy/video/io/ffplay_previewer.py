@@ -69,7 +69,9 @@ class FFPLAY_VideoPreviewer:
                     pass
 
             # ffplay expects C-contiguous raw bytes.
-            if isinstance(img_array, np.ndarray) and (not img_array.flags["C_CONTIGUOUS"]):
+            if isinstance(img_array, np.ndarray) and (
+                not img_array.flags["C_CONTIGUOUS"]
+            ):
                 img_array = np.ascontiguousarray(img_array)
 
             self.proc.stdin.write(memoryview(img_array))
@@ -145,7 +147,11 @@ def ffplay_preview_video(
 
     with FFPLAY_VideoPreviewer(clip.size, fps, pixel_format) as previewer:
         first_frame = True
-        if (gpu_render is not None) and gpu_render.is_enabled() and gpu_render.is_available():
+        if (
+            (gpu_render is not None)
+            and gpu_render.is_enabled()
+            and gpu_render.is_available()
+        ):
             import numpy as np
 
             n_frames = int(clip.duration * fps)
@@ -163,11 +169,15 @@ def ffplay_preview_video(
                     if audio_flag:
                         audio_flag.wait()
         else:
-            for t, frame in clip.iter_frames(with_times=True, fps=fps, dtype="uint8"):
+            for t, frame in clip.iter_frames(
+                with_times=True,
+                fps=fps,
+                dtype="uint8",
+            ):
                 previewer.show_frame(frame)
 
-                # After first frame is shown, if we have audio/video flag, set video ready
-                # and wait for audio
+                # After first frame is shown, if we have audio/video flag,
+                # set video ready and wait for audio
                 if first_frame:
                     first_frame = False
 

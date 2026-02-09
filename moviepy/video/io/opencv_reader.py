@@ -52,7 +52,10 @@ class OpenCV_VideoReader:
 
         self.fps = infos.get("video_fps", 1.0) or 1.0
         self._raw_size = infos.get("video_size", (1, 1))
-        self.size = list(self._raw_size) if isinstance(self._raw_size, (list, tuple)) else self._raw_size
+        if isinstance(self._raw_size, (list, tuple)):
+            self.size = list(self._raw_size)
+        else:
+            self.size = self._raw_size
         self._rotation_tag = infos.get("video_rotation", 0) or 0
         self._rotation_apply = 0
 
@@ -209,7 +212,8 @@ class OpenCV_VideoReader:
         ok, frame = self.cap.read()
         if not ok or frame is None:
             raise IOError(
-                f"MoviePy error: failed to read the first frame of video file {self.filename}."
+                "MoviePy error: failed to read the first frame of video file "
+                f"{self.filename}."
             )
 
         # Detect OpenCV auto-rotation for 90/270 cases by comparing raw frame shape
@@ -239,7 +243,6 @@ class OpenCV_VideoReader:
         self._warned_eof = False
 
     def skip_frames(self, n=1):
-        cv2 = self._require_cv2()
         if not self.cap:
             self.initialize(0)
 
@@ -267,7 +270,8 @@ class OpenCV_VideoReader:
         ok, frame = self.cap.read()
         if not ok or frame is None:
             warn_eof = os.environ.get("MOVIEPY_OPENCV_EOF_WARNING", "0")
-            warn_eof = str(warn_eof).strip().lower() not in {"0", "false", "no", "off", ""}
+            warn_eof_str = str(warn_eof).strip().lower()
+            warn_eof = warn_eof_str not in {"0", "false", "no", "off", ""}
 
             if warn_eof and (not getattr(self, "_warned_eof", False)):
                 warnings.warn(
@@ -307,7 +311,11 @@ class OpenCV_VideoReader:
 
         if pos == self.pos:
             return self.last_read
-        elif getattr(self, "_eof", False) and (self._eof_pos is not None) and (pos >= self._eof_pos):
+        elif (
+            getattr(self, "_eof", False)
+            and (self._eof_pos is not None)
+            and (pos >= self._eof_pos)
+        ):
             return self.last_read
         elif (pos < self.pos) or (pos > self.pos + 100):
             self.initialize(t)

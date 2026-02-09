@@ -133,7 +133,8 @@ class VideoFileClip(VideoClip):
             """Best-effort GPU-resident decode reader.
 
             This is internal-only and should never change public MoviePy APIs.
-            It only activates when the experimental GPU render path is enabled.
+            It activates automatically when a usable CUDA/CuPy runtime is
+            available (unless explicitly disabled), and will fall back safely.
             """
             if _env_flag("MOVIEPY_DISABLE_GPU_DECODE", "0"):
                 raise RuntimeError("GPU decode disabled")
@@ -149,15 +150,21 @@ class VideoFileClip(VideoClip):
             # If the caller asked ffmpeg to resize, preserve that behavior by
             # using the existing readers.
             if (target_resolution is not None) and (None in target_resolution):
-                raise RuntimeError("GPU decode backend requires explicit target_resolution")
+                raise RuntimeError(
+                    "GPU decode backend requires explicit target_resolution"
+                )
 
-            # Only opt-in when GPU render is enabled (best-effort).
-            from moviepy.video.tools import gpu_render
+            # Auto-enable when CUDA/CuPy is usable.
+            # (GPU render may still be disabled; decode can still be GPU-first.)
+            from moviepy.video.tools import cupy_utils, gpu_render
 
             if not (gpu_render.is_enabled() and gpu_render.is_available()):
-                raise RuntimeError("GPU render not enabled")
+                if not cupy_utils.is_cupy_usable():
+                    raise RuntimeError("CUDA/CuPy runtime not usable")
 
-            backend = (os.getenv("MOVIEPY_GPU_DECODE_BACKEND") or "auto").strip().lower()
+            backend = (
+                (os.getenv("MOVIEPY_GPU_DECODE_BACKEND") or "auto").strip().lower()
+            )
             if backend in {"0", "false", "off", "none", "disable", "disabled"}:
                 raise RuntimeError("GPU decode backend disabled")
 
@@ -260,6 +267,18 @@ class VideoFileClip(VideoClip):
 
         self.filename = filename
 
+        # Internal ffmpeg fast-path metadata.
+        #
+        # If the clip remains a raw, untransformed VideoFileClip (optionally
+        # subclipped), we can write it by calling ffmpeg directly on the source
+        # file and avoid iterating frames in Python.
+        #
+        # Any visual transform/effect should clear these attributes.
+        self._ffmpeg_source_filename = filename
+        self._ffmpeg_source_start = 0.0
+        self._ffmpeg_source_target_resolution = target_resolution
+        self._ffmpeg_source_resize_algorithm = resize_algorithm
+
         if has_mask:
             self.frame_function = lambda t: self.reader.get_frame(t)[:, :, :3]
 
@@ -281,6 +300,18 @@ class VideoFileClip(VideoClip):
                 self._gpu_frame_function = lambda t: self.reader.get_frame_gpu(t)
             except Exception:
                 pass
+
+        # Internal batch GPU decode hook.
+        # This is only safe for the *raw* VideoFileClip and should not be relied
+        # upon after arbitrary transform/effect chains.
+        self._gpu_batch_safe = bool(hasattr(self.reader, "get_batch_gpu"))
+        if self._gpu_batch_safe:
+            try:
+                self._gpu_frame_function_batch_by_index = (
+                    lambda idxs: self.reader.get_batch_gpu(idxs)
+                )
+            except Exception:
+                self._gpu_batch_safe = False
 
         # Make a reader for the audio, if any.
         if audio and self.reader.infos["audio_found"]:

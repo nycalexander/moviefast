@@ -19,9 +19,10 @@ class GammaCorrection(Effect):
         # Fast path: precompute a uint8 lookup table for uint8 frames.
         # Must match: (255 * (1.0 * im / 255) ** gamma).astype(uint8)
         # for positive values (i.e. truncation toward 0).
-        lut_np = (255 * (np.arange(256, dtype=np.float64) / 255.0) ** self.gamma).astype(
-            np.uint8
-        )
+        lut_np = (
+            255
+            * (np.arange(256, dtype=np.float64) / 255.0) ** self.gamma
+        ).astype(np.uint8)
         lut_cp = None
 
         def filter(im):

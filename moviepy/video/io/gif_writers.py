@@ -22,7 +22,11 @@ def write_gif_with_imageio(clip, filename, fps=None, loop=0, logger="bar"):
 
     with iio.imopen(filename, "w", plugin="pillow") as writer:
         logger(message="MoviePy - Building file %s with imageio." % filename)
-        if (gpu_render is not None) and gpu_render.is_enabled() and gpu_render.is_available():
+        if (
+            (gpu_render is not None)
+            and gpu_render.is_enabled()
+            and gpu_render.is_available()
+        ):
             # Match Clip.iter_frames() time arithmetic for compatibility.
             n_frames = int(clip.duration * fps)
             for frame_index in logger.iter_bar(frame_index=range(n_frames)):

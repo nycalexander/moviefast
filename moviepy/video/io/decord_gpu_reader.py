@@ -15,6 +15,7 @@ Design goals:
 from __future__ import annotations
 
 from typing import Any
+from typing import Sequence
 
 import numpy as np
 
@@ -122,6 +123,50 @@ class DecordGPUVideoReader:
             out = cp.stack([out, out, out], axis=2)
         if out.ndim == 3 and out.shape[2] >= 3:
             out = out[:, :, :3]
+        if out.dtype != cp.uint8:
+            out = out.astype(cp.uint8)
+
+        try:
+            if not out.flags.c_contiguous:
+                out = cp.ascontiguousarray(out)
+        except Exception:
+            pass
+
+        return out
+
+    def get_batch_gpu(self, indices: Sequence[int]):
+        """Return a batch of CuPy uint8 RGB frames (N, H, W, 3) on GPU.
+
+        This is best-effort and relies on decord's `get_batch` for fewer
+        Python/host round-trips.
+        """
+        if not indices:
+            raise ValueError("indices must be non-empty")
+
+        from moviepy.video.tools import cupy_utils
+
+        cp = cupy_utils.cupy()
+
+        # Decord expects a list-like of ints.
+        idxs = [int(i) for i in indices]
+        batch = self._vr.get_batch(idxs)
+
+        # Convert decord NDArray -> CuPy via DLPack (zero-copy on GPU when supported).
+        if hasattr(batch, "to_dlpack"):
+            capsule = batch.to_dlpack()
+            try:
+                out = cp.fromDlpack(capsule)  # CuPy < 13
+            except Exception:
+                out = cp.from_dlpack(capsule)  # CuPy >= 13
+        else:
+            out = cp.asarray(batch.asnumpy())
+
+        # Ensure (N,H,W,3) uint8.
+        if out.ndim == 3:
+            # (N,H,W) -> expand grayscale.
+            out = cp.stack([out, out, out], axis=3)
+        if out.ndim == 4 and out.shape[3] >= 3:
+            out = out[:, :, :, :3]
         if out.dtype != cp.uint8:
             out = out.astype(cp.uint8)
 

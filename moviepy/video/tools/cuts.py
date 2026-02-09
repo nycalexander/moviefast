@@ -8,14 +8,14 @@ from moviepy.decorators import convert_parameter_to_seconds, use_clip_fps_by_def
 
 
 def _as_numpy_if_cuda_array(arr):
-  if arr is None or not hasattr(arr, "__cuda_array_interface__"):
-    return arr
-  try:
-    import cupy as cp
+    if arr is None or not hasattr(arr, "__cuda_array_interface__"):
+        return arr
+    try:
+        import cupy as cp
 
-    return cp.asnumpy(arr)
-  except Exception:
-    return arr
+        return cp.asnumpy(arr)
+    except Exception:
+        return arr
 
 
 @use_clip_fps_by_default
@@ -50,7 +50,7 @@ def find_video_period(clip, fps=None, start_time=0.3):
     """
 
     def frame(t):
-      return _as_numpy_if_cuda_array(clip.get_frame(t)).flatten()
+        return _as_numpy_if_cuda_array(clip.get_frame(t)).flatten()
 
     timings = np.arange(start_time, clip.duration, 1 / fps)[1:]
     ref = frame(0)
@@ -516,8 +516,8 @@ def detect_scenes(
     """
     if luminosities is None:
         luminosities = [
-        float(_as_numpy_if_cuda_array(f).sum())
-        for f in clip.iter_frames(fps=fps, dtype="uint32", logger=logger)
+            float(_as_numpy_if_cuda_array(f).sum())
+            for f in clip.iter_frames(fps=fps, dtype="uint32", logger=logger)
         ]
 
     luminosities = np.array(luminosities, dtype=float)

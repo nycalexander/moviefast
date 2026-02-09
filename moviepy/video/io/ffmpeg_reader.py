@@ -298,7 +298,12 @@ class FFMPEG_VideoReader:
             elif codec_name == "vp8":
                 i_arg = ["-c:v", "libvpx"] + i_arg
 
-        def _build_cmd(i_arg_local, *, vf_override: str | None = None, sws_flags: str | None = None):
+        def _build_cmd(
+            i_arg_local,
+            *,
+            vf_override: str | None = None,
+            sws_flags: str | None = None,
+        ):
             cmd_local = [FFMPEG_BINARY] + i_arg_local
             cmd_local += [
                 "-loglevel",
@@ -332,7 +337,11 @@ class FFMPEG_VideoReader:
 
         # Candidate 1: end-to-end hwaccel (hwframes) with explicit download.
         if i_arg_hw_e2e is not None:
-            if hwaccel == "cuda" and self._needs_scaler and _env_flag("MOVIEPY_GPU_DECODE_SCALE", "1"):
+            if (
+                hwaccel == "cuda"
+                and self._needs_scaler
+                and _env_flag("MOVIEPY_GPU_DECODE_SCALE", "1")
+            ):
                 # Scale on GPU when available, then download.
                 vf = "scale_cuda=%d:%d,hwdownload,format=%s" % (
                     self.size[0],
@@ -369,6 +378,7 @@ class FFMPEG_VideoReader:
                 "stdin": sp.DEVNULL,
             }
         )
+
         def _spawn_and_preread(cmd_to_run):
             self.proc = sp.Popen(cmd_to_run, **popen_params)
             self.last_read = self.read_frame()
@@ -522,7 +532,10 @@ class FFMPEG_VideoReader:
                 except Exception:
                     pass
 
-            for stream in (getattr(proc, "stdout", None), getattr(proc, "stderr", None)):
+            for stream in (
+                getattr(proc, "stdout", None),
+                getattr(proc, "stderr", None),
+            ):
                 try:
                     if stream is not None:
                         stream.close()

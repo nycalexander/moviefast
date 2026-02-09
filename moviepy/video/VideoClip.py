@@ -838,27 +838,6 @@ class VideoClip(Clip):
                     new_mask[:mask_height, :mask_width] = clip_mask
                     clip_mask = new_mask
 
-        # SET POSITION
-        pos = self.pos(ct)
-        x_start, y_start = compute_position(
-            (clip_width, clip_height),
-            (background_width, background_height),
-            pos,
-            self.relative_pos,
-        )
-
-        # Clip destination coordinates in bg
-        y1_bg = max(y_start, 0)
-        y2_bg = min(y_start + clip_height, background_height)
-        x1_bg = max(x_start, 0)
-        x2_bg = min(x_start + clip_width, background_width)
-
-        # Corresponding source region in clip
-        y1_clip = max(-y_start, 0)
-        y2_clip = y1_clip + (y2_bg - y1_bg)
-        x1_clip = max(-x_start, 0)
-        x2_clip = x1_clip + (x2_bg - x1_bg)
-
         # We will ignore any mask with no transparency so we only ever compute mask
         # if really necessary
         if background_mask is not None and np.min(background_mask) == 1:
@@ -867,7 +846,12 @@ class VideoClip(Clip):
         if clip_mask is not None and np.min(clip_mask) == 1:
             clip_mask = None
 
-        return self._compose_on(background, t, background_mask=background_mask, make_copy=True)
+        return self._compose_on(
+            background,
+            t,
+            background_mask=background_mask,
+            make_copy=True,
+        )
 
     def _compose_on(
         self,
@@ -906,7 +890,10 @@ class VideoClip(Clip):
                     clip_mask = clip_mask[:clip_height, :clip_width]
 
                 if mask_width < clip_width or mask_height < clip_height:
-                    new_mask = np.zeros((clip_height, clip_width), dtype=clip_mask.dtype)
+                    new_mask = np.zeros(
+                        (clip_height, clip_width),
+                        dtype=clip_mask.dtype,
+                    )
                     new_mask[:mask_height, :mask_width] = clip_mask
                     clip_mask = new_mask
 
@@ -1124,28 +1111,6 @@ class VideoClip(Clip):
         if not np.issubdtype(clip_mask.dtype, np.floating):
             clip_mask = clip_mask.astype(float)
 
-        # numpy shape is H*W not W*H
-        bg_h, bg_w = background_mask.shape
-        clip_h, clip_w = clip_mask.shape
-
-        # SET POSITION
-        pos = self.pos(ct)
-        x_start, y_start = compute_position(
-            (clip_w, clip_h), (bg_w, bg_h), pos, self.relative_pos
-        )
-
-        # Clip destination coordinates in bg
-        y1_bg = max(y_start, 0)
-        y2_bg = min(y_start + clip_h, bg_h)
-        x1_bg = max(x_start, 0)
-        x2_bg = min(x_start + clip_w, bg_w)
-
-        # Corresponding source region in clip
-        y1_clip = max(-y_start, 0)
-        y2_clip = y1_clip + (y2_bg - y1_bg)
-        x1_clip = max(-x_start, 0)
-        x2_clip = x1_clip + (x2_bg - x1_bg)
-
         # Blend the overlapping regions
         # The calculus is clip_opacity + bg_opacity * (1 - base_opacity)
         # this ensure that masks are drawn in the right order and
@@ -1164,7 +1129,13 @@ class VideoClip(Clip):
 
         return self._compose_mask(background_mask, t, make_copy=True)
 
-    def _compose_mask(self, background_mask: np.ndarray, t: float, *, make_copy: bool) -> np.ndarray:
+    def _compose_mask(
+        self,
+        background_mask: np.ndarray,
+        t: float,
+        *,
+        make_copy: bool,
+    ) -> np.ndarray:
         """Internal mask compositing helper.
 
         When make_copy is False, background_mask may be modified in-place.
@@ -1181,7 +1152,12 @@ class VideoClip(Clip):
         clip_h, clip_w = clip_mask.shape
 
         pos = self.pos(ct)
-        x_start, y_start = compute_position((clip_w, clip_h), (bg_w, bg_h), pos, self.relative_pos)
+        x_start, y_start = compute_position(
+            (clip_w, clip_h),
+            (bg_w, bg_h),
+            pos,
+            self.relative_pos,
+        )
 
         y1_bg = max(y_start, 0)
         y2_bg = min(y_start + clip_h, bg_h)
@@ -1200,7 +1176,11 @@ class VideoClip(Clip):
 
         # b_region <- clip + b_region * (1 - clip)
         # Use a thread-local scratch buffer to avoid allocating (1 - clip) every frame.
-        tmp = scratch.get_array("compose_mask_tmp", clip_region.shape, dtype=b_region.dtype)
+        tmp = scratch.get_array(
+            "compose_mask_tmp",
+            clip_region.shape,
+            dtype=b_region.dtype,
+        )
         np.copyto(tmp, clip_region, casting="unsafe")
         np.subtract(1.0, tmp, out=tmp)
         b_region *= tmp
@@ -2241,7 +2221,8 @@ class TextClip(ImageClip):
             To summarize, the real height of the text is:
               ``initial padding + (lines - 1) * height + end padding``
             or:
-              ``(ascent + stroke_width) + (lines - 1) * height + (descent + stroke_width)``
+                            ``(ascent + stroke_width) + (lines - 1) * height +``
+                            ``(descent + stroke_width)``
             or:
               ``real_font_size + (stroke_width * 2) + (lines - 1) * height``
         """

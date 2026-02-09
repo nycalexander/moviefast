@@ -199,6 +199,65 @@ class Rotate(Effect):
                 elif (angle == 180) and self.expand:
                     return im[::-1, ::-1]
 
+            # Best-effort GPU-native path for CuPy frames.
+            # Only supports the common case (no custom center/translate). For
+            # other cases we fall back to OpenCV.
+            if is_cuda and (self.center is None) and (self.translate is None):
+                try:
+                    cp = cupy_utils.cupy()
+                    from cupyx.scipy.ndimage import rotate as _rotate  # type: ignore
+
+                    order = {
+                        cv2.INTER_NEAREST: 0,
+                        cv2.INTER_LINEAR: 1,
+                        cv2.INTER_CUBIC: 3,
+                    }.get(resample, 1)
+
+                    bg = self.bg_color
+                    src_dtype = im.dtype
+                    work = im.astype(cp.float32, copy=False)
+
+                    if work.ndim == 3:
+                        # cupyx expects scalar cval; rotate channels separately
+                        # to support RGB border values.
+                        if bg is None:
+                            bg = [0, 0, 0]
+                        if not isinstance(bg, (list, tuple)):
+                            bg = [bg, bg, bg]
+                        chans = []
+                        for c in range(work.shape[2]):
+                            chans.append(
+                                _rotate(
+                                    work[:, :, c],
+                                    float(angle),
+                                    axes=(1, 0),
+                                    reshape=bool(self.expand),
+                                    order=int(order),
+                                    mode="constant",
+                                    cval=float(bg[c]) if c < len(bg) else float(bg[-1]),
+                                    prefilter=False,
+                                )
+                            )
+                        out = cp.stack(chans, axis=2)
+                    else:
+                        cval = 0.0 if (bg is None) else float(bg)
+                        out = _rotate(
+                            work,
+                            float(angle),
+                            axes=(1, 0),
+                            reshape=bool(self.expand),
+                            order=int(order),
+                            mode="constant",
+                            cval=cval,
+                            prefilter=False,
+                        )
+
+                    if src_dtype == cp.uint8:
+                        return cp.clip(out + 0.5, 0.0, 255.0).astype(cp.uint8)
+                    return out.astype(src_dtype, copy=False)
+                except Exception:
+                    pass
+
             cp = None
             if is_cuda:
                 cp = cupy_utils.cupy()

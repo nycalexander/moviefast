@@ -73,9 +73,15 @@ def _kernels():
                     continue
 
                 inv = 1.0 - a
-                bg[by, bx, 0] = np.uint8(np.rint(frame[cy, cx, 0] * a + bg[by, bx, 0] * inv))
-                bg[by, bx, 1] = np.uint8(np.rint(frame[cy, cx, 1] * a + bg[by, bx, 1] * inv))
-                bg[by, bx, 2] = np.uint8(np.rint(frame[cy, cx, 2] * a + bg[by, bx, 2] * inv))
+                bg[by, bx, 0] = np.uint8(
+                    np.rint(frame[cy, cx, 0] * a + bg[by, bx, 0] * inv)
+                )
+                bg[by, bx, 1] = np.uint8(
+                    np.rint(frame[cy, cx, 1] * a + bg[by, bx, 1] * inv)
+                )
+                bg[by, bx, 2] = np.uint8(
+                    np.rint(frame[cy, cx, 2] * a + bg[by, bx, 2] * inv)
+                )
 
     @njit(cache=True, fastmath=True)
     def blend_over_with_masks_u8(

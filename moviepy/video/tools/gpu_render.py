@@ -110,7 +110,11 @@ def _cache_get(cache: dict[int, tuple[weakref.ref, object]], clip) -> object | N
     return None
 
 
-def _cache_set(cache: dict[int, tuple[weakref.ref, object]], clip, value: object) -> None:
+def _cache_set(
+    cache: dict[int, tuple[weakref.ref, object]],
+    clip,
+    value: object,
+) -> None:
     key = id(clip)
 
     def _cleanup(_ref, _key=key, _cache=cache):
@@ -279,7 +283,9 @@ def _composite_rgb_gpu(clip, t):
 
         # Fast-path: if no playing layer has a mask, we can composite entirely
         # in uint8 (no alpha blending), avoiding a full-frame float32 buffer.
-        any_layer_has_mask = any(getattr(layer, "mask", None) is not None for layer in playing)
+        any_layer_has_mask = any(
+            getattr(layer, "mask", None) is not None for layer in playing
+        )
 
         bg_t = t - clip.bg.start
         if isinstance(clip.bg, CompositeVideoClip):
@@ -318,7 +324,11 @@ def _composite_rgb_gpu(clip, t):
                     layer.mask, "is_mask", False
                 ) and hasattr(layer.mask, "img"):
                     layer_mask = _cached_cp_f32_mask_for_imageclip(layer.mask)
-                elif isinstance(layer.mask, CompositeVideoClip) and getattr(layer.mask, "is_mask", False):
+                elif isinstance(layer.mask, CompositeVideoClip) and getattr(
+                    layer.mask,
+                    "is_mask",
+                    False,
+                ):
                     layer_mask = _composite_mask_gpu(layer.mask, ct, dtype=cp.float32)
                 else:
                     layer_mask = _get_mask_frame_gpu_best_effort(layer.mask, ct)
@@ -340,7 +350,12 @@ def _composite_rgb_gpu(clip, t):
                 y2_clip,
                 x1_clip,
                 x2_clip,
-            ) = _coords_for_layer((bg_w, bg_h), (int(fr_u8.shape[1]), int(fr_u8.shape[0])), x_start, y_start)
+            ) = _coords_for_layer(
+                (bg_w, bg_h),
+                (int(fr_u8.shape[1]), int(fr_u8.shape[0])),
+                x_start,
+                y_start,
+            )
 
             if (y2_bg <= y1_bg) or (x2_bg <= x1_bg):
                 continue
@@ -422,7 +437,11 @@ def _composite_mask_gpu(mask_clip, t, *, dtype=None):
 
         for layer in mask_clip.playing_clips(t):
             ct = t - layer.start
-            if isinstance(layer, CompositeVideoClip) and getattr(layer, "is_mask", False):
+            if isinstance(layer, CompositeVideoClip) and getattr(
+                layer,
+                "is_mask",
+                False,
+            ):
                 m = _composite_mask_gpu(layer, ct, dtype=dtype)
             else:
                 m = _get_frame_gpu_best_effort(layer, ct)
@@ -503,7 +522,11 @@ def get_frame_for_export_uint8(clip, t: float):
         # behavior for uint8 masks, and stack via dstack semantics.
         from moviepy.video.compositing.CompositeVideoClip import CompositeVideoClip
 
-        if isinstance(clip.mask, CompositeVideoClip) and getattr(clip.mask, "is_mask", False):
+        if isinstance(clip.mask, CompositeVideoClip) and getattr(
+            clip.mask,
+            "is_mask",
+            False,
+        ):
             m = _composite_mask_gpu(clip.mask, t, dtype=cp.float64)
         else:
             m = _get_frame_gpu_best_effort(clip.mask, t)
@@ -561,7 +584,11 @@ def get_frame_for_export_uint8_gpu(clip, t: float):
         # behavior for uint8 masks, and stack via dstack semantics.
         from moviepy.video.compositing.CompositeVideoClip import CompositeVideoClip
 
-        if isinstance(clip.mask, CompositeVideoClip) and getattr(clip.mask, "is_mask", False):
+        if isinstance(clip.mask, CompositeVideoClip) and getattr(
+            clip.mask,
+            "is_mask",
+            False,
+        ):
             m = _composite_mask_gpu(clip.mask, t, dtype=cp.float64)
         else:
             m = _get_frame_gpu_best_effort(clip.mask, t)

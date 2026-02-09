@@ -419,10 +419,18 @@ def _blend_over_with_masks_u8_opencv_cuda(
     if h <= 0 or w <= 0:
         return True
 
-    bg_gpu = cv2.cuda_GpuMat(); bg_gpu.upload(bg_region)
-    fr_gpu = cv2.cuda_GpuMat(); fr_gpu.upload(fr_region)
-    ac_gpu = cv2.cuda_GpuMat(); ac_gpu.upload(a_clip_region.astype(np.float32, copy=False))
-    ab_gpu = cv2.cuda_GpuMat(); ab_gpu.upload(a_bg_region.astype(np.float32, copy=False))
+    bg_gpu = cv2.cuda_GpuMat()
+    bg_gpu.upload(bg_region)
+    fr_gpu = cv2.cuda_GpuMat()
+    fr_gpu.upload(fr_region)
+
+    a_clip_f32 = a_clip_region.astype(np.float32, copy=False)
+    ac_gpu = cv2.cuda_GpuMat()
+    ac_gpu.upload(a_clip_f32)
+
+    a_bg_f32 = a_bg_region.astype(np.float32, copy=False)
+    ab_gpu = cv2.cuda_GpuMat()
+    ab_gpu.upload(a_bg_f32)
 
     bg_f = bg_gpu.convertTo(cv2.CV_32F)
     fr_f = fr_gpu.convertTo(cv2.CV_32F)
